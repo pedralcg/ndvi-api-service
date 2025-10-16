@@ -1,0 +1,25 @@
+# Archivos de Entorno Virtual Python
+venv/
+.venv/
+env/
+.env
+
+# Archivos de Earth Engine
+# Evitar subir la clave privada del Service Account a un repositorio público
+private-key_pedralcg.json 
+
+# Archivos de caché y compilación Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de Flask/Log (si se generan)
+instance/
+*.log
+
+# Entornos IDE (Visual Studio Code, si aplica)
+.vscode/
+
+# Jupyter/IPython Notebooks (si los usas)
+.ipynb_checkpoints
