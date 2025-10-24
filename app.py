@@ -1,4 +1,4 @@
-# gee_service/app.py - Backend completo con múltiples endpoints
+# gee_service/app.py - Backend actualizado con buffers modificados y datos mejorados
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import ee
@@ -76,29 +76,42 @@ def mask_s2_clouds(image):
     mask = cloud_shadow_mask.And(cloud_mask)
     return image.updateMask(mask).copyProperties(image, ["system:time_start"])
 
-def build_buffered_aoi(geojson_feature):
-    """Crea geometría con buffer de 1km"""
+
+def build_geometry_aoi(geojson_feature):
+    """
+    ACTUALIZADO: Nueva lógica de buffers
+    - Punto: buffer de 5 metros ÚNICAMENTE
+    - Polígonos, rectángulos, círculos: SIN buffer
+    """
     geometry_data = geojson_feature.get("geometry")
     properties = geojson_feature.get("properties", {})
     geom_type = geometry_data.get("type", "").lower()
 
     try:
-        if geom_type == "point" and "radius" in properties:
-            radius_m = properties["radius"]
+        if geom_type == "point":
             coords = geometry_data["coordinates"]
             point_ee = ee.Geometry.Point(coords)
-            final_buffer = radius_m + 1000
-            geom_aoi = point_ee.buffer(final_buffer)
-            print(f"⚪ Círculo: Buffer = {final_buffer}m")
+            
+            # Si tiene radius (círculo), usar ese radio SIN buffer adicional
+            if "radius" in properties:
+                radius_m = properties["radius"]
+                geom_aoi = point_ee.buffer(radius_m)
+                print(f"⚪ Círculo: Radio = {radius_m}m (sin buffer adicional)")
+            else:
+                # Punto simple: buffer de 5m
+                geom_aoi = point_ee.buffer(5)
+                print(f"📍 Punto: Buffer = 5m")
         else:
-            geom_original = ee.Geometry(geometry_data)
-            geom_aoi = geom_original.buffer(1000)
-            print(f"🟦 {geom_type}: Buffer de 1000m aplicado.")
+            # Polígonos, rectángulos, LineString: SIN buffer
+            geom_aoi = ee.Geometry(geometry_data)
+            print(f"🟦 {geom_type.capitalize()}: Sin buffer")
     except Exception as e:
         print(f"⚠️ Error al construir geometría: {e}")
+        traceback.print_exc()
         geom_aoi = ee.Geometry(geometry_data)
 
     return geom_aoi
+
 
 def add_spectral_index(image, index_name):
     """Añade un índice espectral específico a la imagen"""
@@ -126,6 +139,7 @@ def add_spectral_index(image, index_name):
         )
     return image
 
+
 def add_all_indices(image):
     """Añade todos los índices espectrales a la imagen"""
     ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
@@ -140,16 +154,78 @@ def add_all_indices(image):
     }).rename('MSI')
     return image.addBands([ndvi, nbr, cire, msi])
 
+
+def get_image_dates_info(image_collection):
+    """
+    NUEVO: Extrae información detallada de las imágenes en la colección
+    """
+    def get_date_info(img):
+        return ee.Feature(None, {
+            'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+            'cloud_percentage': img.get('CLOUDY_PIXEL_PERCENTAGE'),
+            'tile': img.get('MGRS_TILE')
+        })
+    
+    features = image_collection.map(get_date_info).getInfo()['features']
+    return [
+        {
+            'date': f['properties']['date'],
+            'cloud_percentage': round(f['properties']['cloud_percentage'], 2) if f['properties']['cloud_percentage'] else None,
+            'tile': f['properties']['tile']
+        }
+        for f in features
+    ]
+
+
+def get_visualization_params(index_name):
+    """Retorna parámetros de visualización para cada índice"""
+    params = {
+        'NDVI': {
+            'min': -0.2,
+            'max': 1.0,
+            'palette': [
+                "FFFFFF", "CE7E45", "DF923D", "F1B555", "FCD163",
+                "99B718", "74A901", "66A000", "529400", "3E8601",
+                "207401", "056201", "004C00", "002C00", "001500"
+            ]
+        },
+        'NBR': {
+            'min': -0.5,
+            'max': 1.0,
+            'palette': ['ffffff', '7a8737', 'acbe4d', '0ae042', 'fff70b', 'ffaf38', 'ff641b']
+        },
+        'CIre': {
+            'min': 0,
+            'max': 3.0,
+            'palette': ['8B4513', 'FFFF00', 'ADFF2F', '32CD32', '228B22', '006400']
+        },
+        'MSI': {
+            'min': 0.0,
+            'max': 2.5,
+            'palette': ['006400', '228B22', '9ACD32', 'FFFF00', 'FFA500', 'FF0000']
+        }
+    }
+    return params.get(index_name, params['NDVI'])
+
+
 # -------------------------------------------------------
-# ENDPOINT 1: NDVI original (ya existente)
+# ENDPOINT 1: NDVI/Multi-índice (ACTUALIZADO CON DATOS MEJORADOS)
 # -------------------------------------------------------
 @app.route("/api/ndvi", methods=["POST"])
-def calculate_ndvi():
-    """Endpoint original de cálculo de NDVI"""
+def calculate_index():
+    """
+    Endpoint principal para calcular índices espectrales
+    Body: {
+        "geometry": {...},
+        "date": "2025-10-03",
+        "index": "NDVI"  // opcional, default NDVI
+    }
+    """
     try:
         data = request.json
         date_str = data.get("date")
         geojson_feature = data.get("geometry")
+        index_name = data.get("index", "NDVI")
 
         if not date_str or not geojson_feature:
             return jsonify({
@@ -157,54 +233,80 @@ def calculate_ndvi():
                 "message": "Faltan parámetros: 'date' o 'geometry'."
             }), 400
 
-        geometry_ee = build_buffered_aoi(geojson_feature)
-        area_km2 = geometry_ee.area().divide(1e6).getInfo()
+        # Validar índice
+        if index_name not in ['NDVI', 'NBR', 'CIre', 'MSI']:
+            return jsonify({
+                "status": "error",
+                "message": f"Índice no soportado: {index_name}. Use: NDVI, NBR, CIre, MSI"
+            }), 400
+
+        # Crear geometría con nueva lógica (punto: 5m, polígonos: sin buffer)
+        geometry_ee = build_geometry_aoi(geojson_feature)
+        
+        # Calcular áreas
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
+        
         date_ee = ee.Date(date_str)
         
+        # Colección con ventana de ±1 mes
         col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
             .filterBounds(geometry_ee)\
             .filterDate(date_ee.advance(-1, 'month'), date_ee.advance(1, 'month'))\
             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))\
             .map(mask_s2_clouds)\
-            .map(lambda img: add_spectral_index(img, 'NDVI'))
+            .map(lambda img: add_spectral_index(img, index_name))
         
         imgs_found = col.size().getInfo()
         
         if imgs_found == 0:
             return jsonify({
                 "status": "warning",
-                "message": "⚠️ No hay imágenes disponibles.",
-                "images_found": 0,
+                "message": "⚠️ No hay imágenes disponibles en el periodo.",
+                "images_count": 0,
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
 
+        # Obtener imagen más cercana a la fecha
         def add_diff(img):
             diff = ee.Number(img.date().difference(date_ee, "day")).abs()
             return img.set("diff", diff)
 
         nearest = ee.Image(col.map(add_diff).sort("diff").first())
         
-        mean_val = nearest.reduceRegion(
-            reducer=ee.Reducer.mean(),
+        # Estadísticas COMPLETAS del índice
+        stats = nearest.select(index_name).reduceRegion(
+            reducer=ee.Reducer.mean().combine(
+                ee.Reducer.minMax(), '', True
+            ).combine(
+                ee.Reducer.stdDev(), '', True
+            ).combine(
+                ee.Reducer.median(), '', True
+            ).combine(
+                ee.Reducer.percentile([25, 75]), '', True
+            ),
             geometry=geometry_ee,
             scale=10,
             maxPixels=1e13,
             bestEffort=True
-        )
-        mean_val_numeric = mean_val.get("NDVI").getInfo()
+        ).getInfo()
         
-        vis_params = {
-            "min": 0.0,
-            "max": 1.0,
-            "palette": [
-                "FFFFFF", "CE7E45", "DF923D", "F1B555", "FCD163",
-                "99B718", "74A901", "66A000", "529400", "3E8601",
-                "207401", "056201", "004C00", "002C00", "001500",
-            ],
-        }
-
-        clipped_ndvi = nearest.select("NDVI").clip(geometry_ee)
-        tile_url = clipped_ndvi.getMapId(vis_params)["tile_fetcher"].url_format
+        mean_value = stats.get(f'{index_name}_mean')
+        min_value = stats.get(f'{index_name}_min')
+        max_value = stats.get(f'{index_name}_max')
+        std_value = stats.get(f'{index_name}_stdDev')
+        median_value = stats.get(f'{index_name}_median')
+        p25_value = stats.get(f'{index_name}_p25')
+        p75_value = stats.get(f'{index_name}_p75')
         
+        # Visualización
+        vis_params = get_visualization_params(index_name)
+        clipped = nearest.select(index_name).clip(geometry_ee)
+        tile_url = clipped.getMapId(vis_params)["tile_fetcher"].url_format
+        
+        # Bounds
         try:
             bounds_obj = geometry_ee.bounds().getInfo()
             coords = bounds_obj["coordinates"][0]
@@ -214,24 +316,83 @@ def calculate_ndvi():
         except Exception:
             bounds = None
 
-        image_date = nearest.date().format("YYYY-MM-dd").getInfo()
+        # NUEVO: Información detallada de imágenes
+        images_info = get_image_dates_info(col)
+        image_date_used = nearest.date().format("YYYY-MM-dd").getInfo()
+        
+        # Nubosidad de la imagen usada
+        cloud_percentage = nearest.get('CLOUDY_PIXEL_PERCENTAGE').getInfo()
+        
+        # Tile de Sentinel-2
+        mgrs_tile = nearest.get('MGRS_TILE').getInfo()
+        
+        # Información del satélite
+        spacecraft = nearest.get('SPACECRAFT_NAME').getInfo()
 
+        # RESPUESTA MEJORADA
         return jsonify({
             "status": "success",
-            "mean_ndvi": round(mean_val_numeric, 4) if mean_val_numeric else None,
+            "index": index_name,
+            
+            # ESTADÍSTICAS DEL ÍNDICE (mejoradas)
+            "statistics": {
+                "mean": round(mean_value, 4) if mean_value else None,
+                "min": round(min_value, 4) if min_value else None,
+                "max": round(max_value, 4) if max_value else None,
+                "std": round(std_value, 4) if std_value else None,
+                "median": round(median_value, 4) if median_value else None,
+                "p25": round(p25_value, 4) if p25_value else None,
+                "p75": round(p75_value, 4) if p75_value else None,
+                "range": round(max_value - min_value, 4) if (max_value and min_value) else None
+            },
+            
+            # Compatibilidad con código antiguo
+            f"mean_{index_name.lower()}": round(mean_value, 4) if mean_value else None,
+            "mean_ndvi": round(mean_value, 4) if mean_value else None,
+            
+            # INFORMACIÓN DE IMÁGENES (mejorada)
+            "imagery": {
+                "images_available": images_info,  # Lista completa con detalles
+                "images_count": imgs_found,
+                "image_used": {
+                    "date": image_date_used,
+                    "cloud_percentage": round(cloud_percentage, 2) if cloud_percentage else None,
+                    "tile": mgrs_tile,
+                    "satellite": spacecraft
+                }
+            },
+            
+            # Mantener para compatibilidad
+            "image_date": image_date_used,
+            "images_found": imgs_found,
+            "cloud_percentage": round(cloud_percentage, 2) if cloud_percentage else None,
+            
+            # GEOMETRÍA
+            "geometry": {
+                "area_km2": area_km2,
+                "area_ha": area_ha,
+                "area_m2": round(area_m2, 2),
+                "type": geojson_feature.get("geometry", {}).get("type", "Unknown")
+            },
+            
+            # Mantener para compatibilidad
+            "area_km2": area_km2,
+            
+            # VISUALIZACIÓN
             "tile_url": tile_url,
             "bounds": bounds,
-            "images_found": imgs_found,
-            "image_date": image_date,
-            "area_km2": area_km2,
+            
+            # NUEVO: URL para descarga futura (preparado para GeoTIFF)
+            "download_url": None,  # Implementar en futuro
         })
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 # -------------------------------------------------------
-# ENDPOINT 2: Series Temporales con Tendencia
+# ENDPOINT 2: Series Temporales con Tendencia (ACTUALIZADO)
 # -------------------------------------------------------
 @app.route("/api/timeseries/trend", methods=["POST"])
 def timeseries_with_trend():
@@ -257,7 +418,11 @@ def timeseries_with_trend():
                 "message": "Faltan parámetros requeridos"
             }), 400
         
-        geometry_ee = build_buffered_aoi(geometry)
+        # Usar nueva función de geometría
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
         
         # Parsear fechas
         start_parts = start_month.split('-')
@@ -282,13 +447,14 @@ def timeseries_with_trend():
             .map(lambda img: add_spectral_index(img, index_name))\
             .select([index_name])
         
-        # Verificar si hay imágenes
         imgs_count = col.size().getInfo()
         if imgs_count == 0:
             return jsonify({
                 "status": "warning",
                 "message": "No hay imágenes disponibles en el periodo",
-                "images_found": 0
+                "images_found": 0,
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
         
         # Serie mensual
@@ -322,10 +488,18 @@ def timeseries_with_trend():
             ee.Filter.notNull(['mean'])
         )
         
-        # Calcular deltas
         series_list = series.toList(series.size())
         series_size = series.size().getInfo()
         
+        if series_size == 0:
+            return jsonify({
+                "status": "warning",
+                "message": "No hay datos disponibles en el periodo seleccionado",
+                "images_found": imgs_count,
+                "area_km2": area_km2
+            }), 200
+        
+        # Calcular deltas
         def compute_delta(i):
             i = ee.Number(i)
             curr = ee.Feature(series_list.get(i))
@@ -359,7 +533,7 @@ def timeseries_with_trend():
         slope_vis = {
             'min': -0.05,
             'max': 0.05,
-            'palette': ['red', 'white', 'green']
+            'palette': ['#dc2626', '#f59e0b', '#ffffff', '#a3e635', '#047857']
         }
         slope_clipped = slope.clip(geometry_ee)
         slope_tile_url = slope_clipped.getMapId(slope_vis)['tile_fetcher'].url_format
@@ -382,6 +556,11 @@ def timeseries_with_trend():
             "status": "success",
             "index": index_name,
             "images_found": imgs_count,
+            "geometry": {
+                "area_km2": area_km2,
+                "area_ha": area_ha
+            },
+            "area_km2": area_km2,  # Compatibilidad
             "timeseries": [
                 {
                     'date': f['properties']['date'],
@@ -402,8 +581,9 @@ def timeseries_with_trend():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 # -------------------------------------------------------
-# ENDPOINT 3: Análisis con Umbrales
+# ENDPOINT 3: Análisis con Umbrales (ACTUALIZADO)
 # -------------------------------------------------------
 @app.route("/api/analysis/thresholds", methods=["POST"])
 def analysis_with_thresholds():
@@ -431,7 +611,10 @@ def analysis_with_thresholds():
             'MSI': {'sin_afeccion': 1.00, 'advertencia': 1.30, 'alerta': 1.60}
         }
         
-        geometry_ee = build_buffered_aoi(geometry)
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
         
         # Parsear fechas
         start_parts = start_month.split('-')
@@ -460,7 +643,9 @@ def analysis_with_thresholds():
         if imgs_count == 0:
             return jsonify({
                 "status": "warning",
-                "message": "No hay imágenes disponibles"
+                "message": "No hay imágenes disponibles",
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
         
         # Serie mensual
@@ -537,6 +722,11 @@ def analysis_with_thresholds():
             "status": "success",
             "index": index_name,
             "images_found": imgs_count,
+            "geometry": {
+                "area_km2": area_km2,
+                "area_ha": area_ha
+            },
+            "area_km2": area_km2,  # Compatibilidad
             "timeseries": [
                 {
                     'date': f['properties']['date'],
@@ -552,8 +742,9 @@ def analysis_with_thresholds():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 # -------------------------------------------------------
-# ENDPOINT 4: Compuesto Temporal
+# ENDPOINT 4: Compuesto Temporal (ACTUALIZADO)
 # -------------------------------------------------------
 @app.route("/api/composite/temporal", methods=["POST"])
 def composite_temporal():
@@ -575,7 +766,10 @@ def composite_temporal():
         max_cloud = data.get("max_cloud", 40)
         indices = data.get("indices", ["NDVI"])
         
-        geometry_ee = build_buffered_aoi(geometry)
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
         center_date = ee.Date(center_date_str)
         
         start_date = center_date.advance(-days_window, 'day')
@@ -593,82 +787,77 @@ def composite_temporal():
         if imgs_count == 0:
             return jsonify({
                 "status": "warning",
-                "message": "No hay imágenes en la ventana temporal"
+                "message": "No hay imágenes en la ventana temporal",
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
         
         # Imagen mediana
         median_img = col.median().clip(geometry_ee)
         
-        # Visualizaciones por índice
-        visualizations = {
-            'NDVI': {
-                'min': 0.0,
-                'max': 0.4,
-                'palette': ['FF0000', 'FFA500', 'FFFF00', '00FF00']
-            },
-            'NBR': {
-                'min': -0.5,
-                'max': 1.0,
-                'palette': ['ffffff', '7a8737', 'acbe4d', '0ae042', 'fff70b', 'ffaf38', 'ff641b']
-            },
-            'CIre': {
-                'min': 0,
-                'max': 0.5,
-                'palette': ['8B4513', 'FFA500', 'FFFF00', '90EE90', '008000']
-            },
-            'MSI': {
-                'min': 0.3,
-                'max': 2.0,
-                'palette': ['00008B', '0000FF', '00FFFF', 'FFFF00', 'FFA500', 'FF0000']
-            }
-        }
+        # Información de imágenes usadas
+        images_info = get_image_dates_info(col)
         
         # Generar tiles y calcular estadísticas
         tiles = {}
         stats = {}
         
         for idx in indices:
-            if idx in visualizations:
-                # Tile URL
-                tile_url = median_img.select(idx).getMapId(
-                    visualizations[idx]
-                )['tile_fetcher'].url_format
-                tiles[idx] = tile_url
-                
-                # Estadísticas
-                idx_stats = median_img.select(idx).reduceRegion(
-                    reducer=ee.Reducer.mean().combine(
-                        ee.Reducer.minMax(), '', True
-                    ),
-                    geometry=geometry_ee,
-                    scale=10,
-                    maxPixels=1e13,
-                    bestEffort=True
-                ).getInfo()
-                
-                stats[idx] = {
-                    'mean': idx_stats.get(f'{idx}_mean'),
-                    'min': idx_stats.get(f'{idx}_min'),
-                    'max': idx_stats.get(f'{idx}_max')
-                }
+            # Visualización
+            vis_params = get_visualization_params(idx)
+            
+            # Tile URL
+            tile_url = median_img.select(idx).getMapId(vis_params)['tile_fetcher'].url_format
+            tiles[idx] = tile_url
+            
+            # Estadísticas completas
+            idx_stats = median_img.select(idx).reduceRegion(
+                reducer=ee.Reducer.mean().combine(
+                    ee.Reducer.minMax(), '', True
+                ).combine(
+                    ee.Reducer.stdDev(), '', True
+                ),
+                geometry=geometry_ee,
+                scale=10,
+                maxPixels=1e13,
+                bestEffort=True
+            ).getInfo()
+            
+            stats[idx] = {
+                'mean': round(idx_stats.get(f'{idx}_mean'), 4) if idx_stats.get(f'{idx}_mean') else None,
+                'min': round(idx_stats.get(f'{idx}_min'), 4) if idx_stats.get(f'{idx}_min') else None,
+                'max': round(idx_stats.get(f'{idx}_max'), 4) if idx_stats.get(f'{idx}_max') else None,
+                'std': round(idx_stats.get(f'{idx}_stdDev'), 4) if idx_stats.get(f'{idx}_stdDev') else None
+            }
         
         return jsonify({
             "status": "success",
             "tiles": tiles,
-            "stats": stats,
+            "statistics": stats,
+            "imagery": {
+                "images_used": imgs_count,
+                "images_info": images_info,
+                "date_range": {
+                    'start': start_date.format('YYYY-MM-dd').getInfo(),
+                    'end': end_date.format('YYYY-MM-dd').getInfo()
+                }
+            },
+            "geometry": {
+                "area_km2": area_km2,
+                "area_ha": area_ha
+            },
+            # Compatibilidad
             "images_used": imgs_count,
-            "date_range": {
-                'start': start_date.format('YYYY-MM-dd').getInfo(),
-                'end': end_date.format('YYYY-MM-dd').getInfo()
-            }
+            "stats": stats
         })
         
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 # -------------------------------------------------------
-# ENDPOINT 5: Comparación Multi-índice
+# ENDPOINT 5: Comparación Multi-índice (ACTUALIZADO)
 # -------------------------------------------------------
 @app.route("/api/indices/compare", methods=["POST"])
 def compare_indices():
@@ -686,7 +875,10 @@ def compare_indices():
         date_str = data.get("date")
         indices = data.get("indices", ["NDVI", "NBR", "CIre", "MSI"])
         
-        geometry_ee = build_buffered_aoi(geometry)
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
         date_ee = ee.Date(date_str)
         
         # Colección
@@ -701,7 +893,9 @@ def compare_indices():
         if imgs_found == 0:
             return jsonify({
                 "status": "warning",
-                "message": "No hay imágenes disponibles"
+                "message": "No hay imágenes disponibles",
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
         
         # Imagen más cercana
@@ -711,48 +905,60 @@ def compare_indices():
         
         nearest = ee.Image(col.map(add_diff).sort("diff").first())
         image_date = nearest.date().format("YYYY-MM-dd").getInfo()
-        
-        # Visualizaciones
-        visualizations = {
-            'NDVI': {'min': 0.0, 'max': 1.0, 'palette': ['FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901', '66A000', '529400', '3E8601', '207401', '056201', '004C00', '002C00', '001500']},
-            'NBR': {'min': -0.5, 'max': 1.0, 'palette': ['ffffff', '7a8737', 'acbe4d', '0ae042', 'fff70b', 'ffaf38', 'ff641b']},
-            'CIre': {'min': 0, 'max': 0.5, 'palette': ['8B4513', 'FFA500', 'FFFF00', '90EE90', '008000']},
-            'MSI': {'min': 0.3, 'max': 2.0, 'palette': ['00008B', '0000FF', '00FFFF', 'FFFF00', 'FFA500', 'FF0000']}
-        }
+        cloud_percentage = nearest.get('CLOUDY_PIXEL_PERCENTAGE').getInfo()
         
         results = {}
         for idx in indices:
-            # Estadísticas
-            mean_val = nearest.reduceRegion(
-                reducer=ee.Reducer.mean(),
+            # Estadísticas completas
+            idx_stats = nearest.select(idx).reduceRegion(
+                reducer=ee.Reducer.mean().combine(
+                    ee.Reducer.minMax(), '', True
+                ).combine(
+                    ee.Reducer.stdDev(), '', True
+                ),
                 geometry=geometry_ee,
                 scale=10,
                 maxPixels=1e13,
                 bestEffort=True
-            )
+            ).getInfo()
             
-            # Tile URL
+            # Visualización
+            vis_params = get_visualization_params(idx)
             clipped = nearest.select(idx).clip(geometry_ee)
-            tile_url = clipped.getMapId(visualizations[idx])['tile_fetcher'].url_format
+            tile_url = clipped.getMapId(vis_params)['tile_fetcher'].url_format
             
             results[idx] = {
-                'mean': round(mean_val.get(idx).getInfo(), 4) if mean_val.get(idx).getInfo() else None,
+                'mean': round(idx_stats.get(f'{idx}_mean'), 4) if idx_stats.get(f'{idx}_mean') else None,
+                'min': round(idx_stats.get(f'{idx}_min'), 4) if idx_stats.get(f'{idx}_min') else None,
+                'max': round(idx_stats.get(f'{idx}_max'), 4) if idx_stats.get(f'{idx}_max') else None,
+                'std': round(idx_stats.get(f'{idx}_stdDev'), 4) if idx_stats.get(f'{idx}_stdDev') else None,
                 'tile_url': tile_url
             }
         
         return jsonify({
             "status": "success",
+            "imagery": {
+                "image_date": image_date,
+                "images_found": imgs_found,
+                "cloud_percentage": round(cloud_percentage, 2) if cloud_percentage else None
+            },
+            "geometry": {
+                "area_km2": area_km2,
+                "area_ha": area_ha
+            },
+            "results": results,
+            # Compatibilidad
             "image_date": image_date,
-            "images_found": imgs_found,
-            "results": results
+            "images_found": imgs_found
         })
         
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 # -------------------------------------------------------
-# ENDPOINT 6: Detección de Anomalías
+# ENDPOINT 6: Detección de Anomalías (ACTUALIZADO)
 # -------------------------------------------------------
 @app.route("/api/anomalies/detect", methods=["POST"])
 def detect_anomalies():
@@ -774,7 +980,10 @@ def detect_anomalies():
         ref_end = data.get("reference_end")
         test_date = data.get("test_date")
         
-        geometry_ee = build_buffered_aoi(geometry)
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
         
         # Periodo de referencia (histórico)
         ref_start_parts = ref_start.split('-')
@@ -803,7 +1012,9 @@ def detect_anomalies():
         if hist_count == 0:
             return jsonify({
                 "status": "warning",
-                "message": "No hay imágenes en el periodo de referencia"
+                "message": "No hay imágenes en el periodo de referencia",
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
         
         # Calcular media y desviación estándar histórica
@@ -842,7 +1053,9 @@ def detect_anomalies():
         if test_count == 0:
             return jsonify({
                 "status": "warning",
-                "message": "No hay imágenes en la fecha de test"
+                "message": "No hay imágenes en la fecha de test",
+                "area_km2": area_km2,
+                "area_ha": area_ha
             }), 200
         
         def add_diff(img):
@@ -883,9 +1096,9 @@ def detect_anomalies():
         
         # Determinar tipo de anomalía
         if z_score < -1.5:
-            anomaly_type = "degradation"  # Degradación
+            anomaly_type = "degradation"
         elif z_score > 1.5:
-            anomaly_type = "improvement"  # Mejora
+            anomaly_type = "improvement"
         else:
             anomaly_type = "normal"
         
@@ -900,12 +1113,17 @@ def detect_anomalies():
             "current_value": round(current_value, 4),
             "reference_images": hist_count,
             "test_images": test_count,
-            "test_image_date": test_img.date().format("YYYY-MM-dd").getInfo()
+            "test_image_date": test_img.date().format("YYYY-MM-dd").getInfo(),
+            "geometry": {
+                "area_km2": area_km2,
+                "area_ha": area_ha
+            }
         })
         
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 # -------------------------------------------------------
 # ENDPOINT 7: Health Check
@@ -914,13 +1132,12 @@ def detect_anomalies():
 def health_check():
     """Verifica el estado del servicio"""
     try:
-        # Test simple de GEE
         test = ee.Number(1).getInfo()
         return jsonify({
             "status": "healthy",
             "service": "GeoVisor Backend API",
             "gee_initialized": True,
-            "version": "2.0.0"
+            "version": "2.1.0"
         })
     except Exception as e:
         return jsonify({
@@ -929,6 +1146,7 @@ def health_check():
             "gee_initialized": False,
             "error": str(e)
         }), 500
+
 
 # -------------------------------------------------------
 # ENDPOINT 8: Listar Índices Disponibles
@@ -1012,6 +1230,95 @@ def list_indices():
         "status": "success",
         "indices": indices_info
     })
+
+# -------------------------------------------------------
+# ENDPOINT 9: Descarga GeoTIFF
+# -------------------------------------------------------
+@app.route("/api/download/geotiff", methods=["POST"])
+def download_geotiff():
+    """
+    Genera URL de descarga de GeoTIFF
+    Body: {
+        "geometry": {...},
+        "date": "2025-10-03",
+        "index": "NDVI"
+    }
+    """
+    try:
+        data = request.json
+        geometry = data.get("geometry")
+        date_str = data.get("date")
+        index_name = data.get("index", "NDVI")
+        
+        if not all([geometry, date_str]):
+            return jsonify({
+                "status": "error",
+                "message": "Faltan parámetros requeridos"
+            }), 400
+        
+        # Validar índice
+        if index_name not in ['NDVI', 'NBR', 'CIre', 'MSI']:
+            return jsonify({
+                "status": "error",
+                "message": f"Índice no soportado: {index_name}"
+            }), 400
+        
+        # Crear geometría
+        geometry_ee = build_geometry_aoi(geometry)
+        date_ee = ee.Date(date_str)
+        
+        # Colección
+        col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+            .filterBounds(geometry_ee)\
+            .filterDate(date_ee.advance(-1, 'month'), date_ee.advance(1, 'month'))\
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))\
+            .map(mask_s2_clouds)\
+            .map(lambda img: add_spectral_index(img, index_name))
+        
+        imgs_count = col.size().getInfo()
+        
+        if imgs_count == 0:
+            return jsonify({
+                "status": "error",
+                "message": "No hay imágenes disponibles para generar el GeoTIFF"
+            }), 404
+        
+        # Imagen más cercana
+        def add_diff(img):
+            diff = ee.Number(img.date().difference(date_ee, "day")).abs()
+            return img.set("diff", diff)
+        
+        nearest = ee.Image(col.map(add_diff).sort("diff").first())
+        clipped = nearest.select(index_name).clip(geometry_ee)
+        
+        # Obtener fecha de la imagen
+        image_date = nearest.date().format("YYYY-MM-dd").getInfo()
+        
+        # Generar URL de descarga
+        # IMPORTANTE: getDownloadURL puede tardar, considerar usar getThumbURL para previews
+        download_url = clipped.getDownloadURL({
+            'scale': 10,  # 10 metros de resolución
+            'crs': 'EPSG:4326',  # WGS84
+            'fileFormat': 'GeoTIFF',
+            'region': geometry_ee.bounds().getInfo()['coordinates']
+        })
+        
+        return jsonify({
+            "status": "success",
+            "download_url": download_url,
+            "filename": f"{index_name}_{image_date}.tif",
+            "image_date": image_date,
+            "index": index_name,
+            "images_found": imgs_count,
+            "message": "GeoTIFF generado correctamente. El enlace es válido por 24 horas."
+        })
+        
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": f"Error al generar GeoTIFF: {str(e)}"
+        }), 500
 
 # -------------------------------------------------------
 # Ejecutar aplicación
