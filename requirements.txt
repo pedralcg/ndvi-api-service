@@ -4,3 +4,4 @@ flask-cors
 earthengine-api
 python-dotenv
 gunicorn  # Añade esto, ya que Render lo necesita para la producción.
+numpy

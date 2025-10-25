@@ -1232,7 +1232,7 @@ def list_indices():
     })
 
 # -------------------------------------------------------
-# ENDPOINT 9: Descarga GeoTIFF
+# ENDPOINT 9: Descarga GeoTIFF (VERSIÓN COMPLETA)
 # -------------------------------------------------------
 @app.route("/api/download/geotiff", methods=["POST"])
 def download_geotiff():
@@ -1244,8 +1244,12 @@ def download_geotiff():
         "index": "NDVI"
     }
     """
+    print("🔵 Endpoint /api/download/geotiff llamado")  # DEBUG
+    
     try:
         data = request.json
+        print(f"📥 Datos recibidos: {data}")  # DEBUG
+        
         geometry = data.get("geometry")
         date_str = data.get("date")
         index_name = data.get("index", "NDVI")
@@ -1253,7 +1257,7 @@ def download_geotiff():
         if not all([geometry, date_str]):
             return jsonify({
                 "status": "error",
-                "message": "Faltan parámetros requeridos"
+                "message": "Faltan parámetros requeridos: geometry y date"
             }), 400
         
         # Validar índice
@@ -1265,6 +1269,24 @@ def download_geotiff():
         
         # Crear geometría
         geometry_ee = build_geometry_aoi(geometry)
+        
+        # Calcular área y validar límites
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        
+        print(f"📐 Área calculada: {area_km2} km²")  # DEBUG
+        
+        # VALIDACIÓN DE ÁREA
+        if area_km2 > 100:
+            return jsonify({
+                "status": "error",
+                "message": f"El área es demasiado grande ({area_km2:.2f} km²). Límite: 100 km².",
+                "area_km2": area_km2
+            }), 400
+        
+        if area_km2 > 50:
+            print(f"⚠️ Área grande: {area_km2:.2f} km²")
+        
         date_ee = ee.Date(date_str)
         
         # Colección
@@ -1276,6 +1298,7 @@ def download_geotiff():
             .map(lambda img: add_spectral_index(img, index_name))
         
         imgs_count = col.size().getInfo()
+        print(f"🛰️ Imágenes encontradas: {imgs_count}")  # DEBUG
         
         if imgs_count == 0:
             return jsonify({
@@ -1294,14 +1317,24 @@ def download_geotiff():
         # Obtener fecha de la imagen
         image_date = nearest.date().format("YYYY-MM-dd").getInfo()
         
+        print(f"✅ Generando GeoTIFF: {index_name} - {image_date} - {area_km2} km²")
+        
         # Generar URL de descarga
-        # IMPORTANTE: getDownloadURL puede tardar, considerar usar getThumbURL para previews
-        download_url = clipped.getDownloadURL({
-            'scale': 10,  # 10 metros de resolución
-            'crs': 'EPSG:4326',  # WGS84
-            'fileFormat': 'GeoTIFF',
-            'region': geometry_ee.bounds().getInfo()['coordinates']
-        })
+        try:
+            download_url = clipped.getDownloadURL({
+                'scale': 10,
+                'crs': 'EPSG:4326',
+                'fileFormat': 'GeoTIFF',
+                'region': geometry_ee.bounds().getInfo()['coordinates']
+            })
+            print(f"🔗 URL generada exitosamente")  # DEBUG
+        except Exception as download_error:
+            print(f"❌ Error generando URL: {download_error}")
+            traceback.print_exc()
+            return jsonify({
+                "status": "error",
+                "message": f"Error al generar URL de descarga: {str(download_error)}"
+            }), 500
         
         return jsonify({
             "status": "success",
@@ -1310,15 +1343,256 @@ def download_geotiff():
             "image_date": image_date,
             "index": index_name,
             "images_found": imgs_count,
-            "message": "GeoTIFF generado correctamente. El enlace es válido por 24 horas."
+            "area_km2": area_km2,
+            "message": f"GeoTIFF generado correctamente ({area_km2:.2f} km²). Válido 24h."
         })
         
     except Exception as e:
+        print(f"❌ Error en download_geotiff: {e}")
         traceback.print_exc()
         return jsonify({
             "status": "error",
             "message": f"Error al generar GeoTIFF: {str(e)}"
         }), 500
+
+
+# -------------------------------------------------------
+# ENDPOINT 10: Calculadora de Umbrales Inteligente
+# -------------------------------------------------------
+@app.route("/api/thresholds/calculate", methods=["POST"])
+def calculate_thresholds():
+    """
+    Calcula umbrales óptimos basándose en análisis estadístico de datos históricos.
+    Body: {
+        "geometry": {...},
+        "index": "NDVI",
+        "start_month": "2017-04",
+        "end_month": "2025-10",
+        "method": "percentiles"
+    }
+    """
+    print("🔵 Endpoint /api/thresholds/calculate llamado")
+    
+    try:
+        data = request.json
+        print(f"📥 Datos recibidos: {data}")
+        
+        geometry = data.get('geometry')
+        index_name = data.get('index', 'NDVI')
+        start_month = data.get('start_month', '2017-04')
+        end_month = data.get('end_month')
+        method = data.get('method', 'percentiles')
+        
+        if not geometry:
+            return jsonify({'status': 'error', 'message': 'Geometría requerida'}), 400
+        
+        if index_name not in ['NDVI', 'NBR', 'CIre', 'MSI']:
+            return jsonify({'status': 'error', 'message': f'Índice no soportado: {index_name}'}), 400
+        
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        print(f"📐 Área: {area_km2} km²")
+        
+        # Parsear fechas
+        start_date = f"{start_month}-01"
+        if end_month:
+            end_year, end_month_num = end_month.split('-')
+            if end_month_num in ['01', '03', '05', '07', '08', '10', '12']:
+                last_day = '31'
+            elif end_month_num in ['04', '06', '09', '11']:
+                last_day = '30'
+            else:
+                last_day = '28'
+            end_date = f"{end_month}-{last_day}"
+        else:
+            from datetime import datetime
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        print(f"📅 Periodo: {start_date} a {end_date}")
+        
+        # Cargar colección
+        collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+            .filterBounds(geometry_ee) \
+            .filterDate(start_date, end_date) \
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
+            .map(mask_s2_clouds)
+        
+        collection_with_index = collection.map(lambda img: add_spectral_index(img, index_name))
+        total_images = collection.size().getInfo()
+        print(f"🛰️ Imágenes totales: {total_images}")
+        
+        if total_images == 0:
+            return jsonify({
+                'status': 'error',
+                'message': 'No se encontraron imágenes para el periodo seleccionado'
+            }), 404
+        
+        # Generar lista de meses
+        from datetime import datetime
+        start_year, start_month_num = map(int, start_month.split('-'))
+        end_year, end_month_num = map(int, end_month.split('-'))
+        
+        months = []
+        current_date = datetime(start_year, start_month_num, 1)
+        end_date_obj = datetime(end_year, end_month_num, 1)
+        
+        while current_date <= end_date_obj:
+            months.append(current_date.strftime('%Y-%m'))
+            if current_date.month == 12:
+                current_date = datetime(current_date.year + 1, 1, 1)
+            else:
+                current_date = datetime(current_date.year, current_date.month + 1, 1)
+        
+        print(f"📊 Procesando {len(months)} meses...")
+        
+        # Procesar cada mes
+        timeseries = []
+        for month in months:
+            year = int(month.split('-')[0])
+            month_num = int(month.split('-')[1])
+            
+            start = ee.Date.fromYMD(year, month_num, 1)
+            end = start.advance(1, 'month')
+            
+            monthly_collection = collection_with_index.filterDate(start, end)
+            count = monthly_collection.size().getInfo()
+            
+            if count > 0:
+                mean_image = monthly_collection.select(index_name).mean()
+                stats = mean_image.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geometry_ee,
+                    scale=10,
+                    maxPixels=1e9
+                ).getInfo()
+                
+                mean_value = stats.get(index_name)
+                if mean_value is not None:
+                    timeseries.append({
+                        'date': month,
+                        'mean': mean_value,
+                        'count': count
+                    })
+        
+        print(f"✅ Serie temporal: {len(timeseries)} puntos válidos")
+        
+        if len(timeseries) == 0:
+            return jsonify({
+                'status': 'error',
+                'message': 'No se encontraron datos válidos para el periodo seleccionado'
+            }), 404
+        
+        # Extraer valores para análisis
+        import numpy as np
+        values = np.array([item['mean'] for item in timeseries])
+        
+        # Estadísticas básicas
+        statistics = {
+            'mean': float(np.mean(values)),
+            'median': float(np.median(values)),
+            'std': float(np.std(values)),
+            'min': float(np.min(values)),
+            'max': float(np.max(values)),
+            'count': len(values),
+            'p10': float(np.percentile(values, 10)),
+            'p25': float(np.percentile(values, 25)),
+            'p50': float(np.percentile(values, 50)),
+            'p75': float(np.percentile(values, 75)),
+            'p90': float(np.percentile(values, 90)),
+        }
+        
+        print(f"📈 Estadísticas - Media: {statistics['mean']:.4f}, Std: {statistics['std']:.4f}")
+        
+        # Calcular umbrales según método
+        if method == 'percentiles':
+            suggested_thresholds = {
+                'sin_afeccion': float(np.percentile(values, 75)),
+                'advertencia': float(np.percentile(values, 50)),
+                'alerta': float(np.percentile(values, 25))
+            }
+        elif method == 'std_deviation':
+            mean = np.mean(values)
+            std = np.std(values)
+            suggested_thresholds = {
+                'sin_afeccion': float(mean + 0.5 * std),
+                'advertencia': float(mean),
+                'alerta': float(mean - std)
+            }
+        elif method == 'seasonal':
+            monthly_data = {}
+            for item in timeseries:
+                month = item['date'].split('-')[1]
+                if month not in monthly_data:
+                    monthly_data[month] = []
+                monthly_data[month].append(item['mean'])
+            
+            all_p25 = []
+            all_p50 = []
+            all_p75 = []
+            
+            for month_key, month_values in monthly_data.items():
+                if len(month_values) > 0:
+                    all_p25.append(np.percentile(month_values, 25))
+                    all_p50.append(np.percentile(month_values, 50))
+                    all_p75.append(np.percentile(month_values, 75))
+            
+            suggested_thresholds = {
+                'sin_afeccion': float(np.mean(all_p75)) if all_p75 else 0.6,
+                'advertencia': float(np.mean(all_p50)) if all_p50 else 0.4,
+                'alerta': float(np.mean(all_p25)) if all_p25 else 0.3
+            }
+        else:
+            suggested_thresholds = {
+                'sin_afeccion': float(np.percentile(values, 75)),
+                'advertencia': float(np.percentile(values, 50)),
+                'alerta': float(np.percentile(values, 25))
+            }
+        
+        print(f"🎯 Umbrales calculados ({method}): {suggested_thresholds}")
+        
+        # Crear histograma
+        hist, bin_edges = np.histogram(values, bins=20)
+        histogram = {
+            'frequencies': hist.tolist(),
+            'bins': bin_edges[:-1].tolist(),
+        }
+        
+        return jsonify({
+            'status': 'success',
+            'index': index_name,
+            'method': method,
+            'suggested_thresholds': suggested_thresholds,
+            'statistics': statistics,
+            'timeseries': timeseries,
+            'histogram': histogram,
+            'images_found': total_images,
+            'period': {
+                'start': start_month,
+                'end': end_month
+            },
+            'area_km2': area_km2
+        })
+        
+    except Exception as e:
+        print(f"❌ Error en calculate_thresholds: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': f'Error al calcular umbrales: {str(e)}'
+        }), 500
+
+
+# -------------------------------------------------------
+# DEBUG: Listar todas las rutas registradas
+# -------------------------------------------------------
+print("\n" + "="*60)
+print("🔍 RUTAS REGISTRADAS EN FLASK:")
+print("="*60)
+for rule in app.url_map.iter_rules():
+    print(f"  {rule.methods} {rule.rule}")
+print("="*60 + "\n")
+
 
 # -------------------------------------------------------
 # Ejecutar aplicación
