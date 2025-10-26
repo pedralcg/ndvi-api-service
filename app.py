@@ -1614,6 +1614,267 @@ def calculate_thresholds():
 
 
 # -------------------------------------------------------
+# ENDPOINT 11: Mapa de Diferencias/Cambios
+# -------------------------------------------------------
+@app.route("/api/analysis/change-map", methods=["POST"])
+def generate_change_map():
+    """
+    Genera un mapa raster mostrando las mayores diferencias entre dos periodos
+    Body: {
+        "geometry": {...},
+        "index": "NDVI",
+        "baseline_start": "2020-01",
+        "baseline_end": "2020-12",
+        "comparison_start": "2024-01",
+        "comparison_end": "2024-12"
+    }
+    """
+    print("🔵 Endpoint /api/analysis/change-map llamado")
+    
+    try:
+        data = request.json
+        geometry = data.get('geometry')
+        index_name = data.get('index', 'NDVI')
+        baseline_start = data.get('baseline_start')
+        baseline_end = data.get('baseline_end')
+        comparison_start = data.get('comparison_start')
+        comparison_end = data.get('comparison_end')
+        
+        if not all([geometry, baseline_start, baseline_end, comparison_start, comparison_end]):
+            return jsonify({
+                'status': 'error',
+                'message': 'Faltan parámetros requeridos'
+            }), 400
+        
+        geometry_ee = build_geometry_aoi(geometry)
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        
+        # Parsear fechas baseline
+        baseline_start_parts = baseline_start.split('-')
+        baseline_end_parts = baseline_end.split('-')
+        baseline_start_date = ee.Date.fromYMD(
+            ee.Number.parse(baseline_start_parts[0]),
+            ee.Number.parse(baseline_start_parts[1]),
+            1
+        )
+        baseline_end_date = ee.Date.fromYMD(
+            ee.Number.parse(baseline_end_parts[0]),
+            ee.Number.parse(baseline_end_parts[1]),
+            1
+        ).advance(1, 'month')
+        
+        # Parsear fechas comparison
+        comparison_start_parts = comparison_start.split('-')
+        comparison_end_parts = comparison_end.split('-')
+        comparison_start_date = ee.Date.fromYMD(
+            ee.Number.parse(comparison_start_parts[0]),
+            ee.Number.parse(comparison_start_parts[1]),
+            1
+        )
+        comparison_end_date = ee.Date.fromYMD(
+            ee.Number.parse(comparison_end_parts[0]),
+            ee.Number.parse(comparison_end_parts[1]),
+            1
+        ).advance(1, 'month')
+        
+        # Colección baseline
+        baseline_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+            .filterBounds(geometry_ee) \
+            .filterDate(baseline_start_date, baseline_end_date) \
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
+            .map(mask_s2_clouds) \
+            .map(lambda img: add_spectral_index(img, index_name)) \
+            .select([index_name])
+        
+        baseline_count = baseline_col.size().getInfo()
+        
+        # Colección comparison
+        comparison_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+            .filterBounds(geometry_ee) \
+            .filterDate(comparison_start_date, comparison_end_date) \
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
+            .map(mask_s2_clouds) \
+            .map(lambda img: add_spectral_index(img, index_name)) \
+            .select([index_name])
+        
+        comparison_count = comparison_col.size().getInfo()
+        
+        if baseline_count == 0 or comparison_count == 0:
+            return jsonify({
+                'status': 'error',
+                'message': f'No hay suficientes imágenes. Baseline: {baseline_count}, Comparación: {comparison_count}'
+            }), 404
+        
+        print(f"📊 Baseline: {baseline_count} imágenes, Comparación: {comparison_count} imágenes")
+        
+        # Calcular medias
+        baseline_mean = baseline_col.mean()
+        comparison_mean = comparison_col.mean()
+        
+        # Calcular diferencia (comparison - baseline)
+        difference = comparison_mean.subtract(baseline_mean).rename('difference')
+        
+        # Calcular diferencia porcentual
+        percent_change = difference.divide(baseline_mean).multiply(100).rename('percent_change')
+        
+        # Recortar a la geometría
+        difference_clipped = difference.clip(geometry_ee)
+        percent_clipped = percent_change.clip(geometry_ee)
+        
+        # Estadísticas de la diferencia
+        diff_stats = difference_clipped.reduceRegion(
+            reducer=ee.Reducer.mean().combine(
+                ee.Reducer.minMax(), '', True
+            ).combine(
+                ee.Reducer.stdDev(), '', True
+            ).combine(
+                ee.Reducer.percentile([10, 25, 50, 75, 90]), '', True
+            ),
+            geometry=geometry_ee,
+            scale=10,
+            maxPixels=1e9,
+            bestEffort=True
+        ).getInfo()
+        
+        # Visualización del mapa de diferencias
+        # Rojo = degradación, Blanco = sin cambio, Verde = mejora
+        diff_viz = {
+            'min': -0.3,
+            'max': 0.3,
+            'palette': [
+                '#8B0000',  # Rojo oscuro (gran degradación)
+                '#DC143C',  # Rojo
+                '#FF6B6B',  # Rojo claro
+                '#FFA07A',  # Naranja claro
+                '#FFFFFF',  # Blanco (sin cambio)
+                '#90EE90',  # Verde claro
+                '#32CD32',  # Verde lima
+                '#228B22',  # Verde
+                '#006400'   # Verde oscuro (gran mejora)
+            ]
+        }
+        
+        difference_tile_url = difference_clipped.getMapId(diff_viz)['tile_fetcher'].url_format
+        
+        # Visualización del cambio porcentual
+        percent_viz = {
+            'min': -50,
+            'max': 50,
+            'palette': diff_viz['palette']
+        }
+        
+        percent_tile_url = percent_clipped.getMapId(percent_viz)['tile_fetcher'].url_format
+        
+        # Clasificar áreas por magnitud de cambio
+        # Crear máscaras para diferentes categorías
+        high_degradation = difference.lt(-0.15)  # < -0.15
+        moderate_degradation = difference.lt(-0.05).And(difference.gte(-0.15))  # -0.15 a -0.05
+        stable = difference.gte(-0.05).And(difference.lte(0.05))  # -0.05 a 0.05
+        moderate_improvement = difference.gt(0.05).And(difference.lte(0.15))  # 0.05 a 0.15
+        high_improvement = difference.gt(0.15)  # > 0.15
+        
+        # Calcular áreas de cada categoría
+        pixel_area = ee.Image.pixelArea()
+        
+        def calculate_area(mask):
+            area = pixel_area.updateMask(mask).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=geometry_ee,
+                scale=10,
+                maxPixels=1e9,
+                bestEffort=True
+            )
+            return area.get('area').getInfo()
+        
+        area_high_degradation = calculate_area(high_degradation)
+        area_moderate_degradation = calculate_area(moderate_degradation)
+        area_stable = calculate_area(stable)
+        area_moderate_improvement = calculate_area(moderate_improvement)
+        area_high_improvement = calculate_area(high_improvement)
+        
+        # Convertir a hectáreas
+        change_areas = {
+            'high_degradation': {
+                'area_ha': round(area_high_degradation / 10000, 2) if area_high_degradation else 0,
+                'percentage': round((area_high_degradation / area_m2) * 100, 2) if area_high_degradation else 0
+            },
+            'moderate_degradation': {
+                'area_ha': round(area_moderate_degradation / 10000, 2) if area_moderate_degradation else 0,
+                'percentage': round((area_moderate_degradation / area_m2) * 100, 2) if area_moderate_degradation else 0
+            },
+            'stable': {
+                'area_ha': round(area_stable / 10000, 2) if area_stable else 0,
+                'percentage': round((area_stable / area_m2) * 100, 2) if area_stable else 0
+            },
+            'moderate_improvement': {
+                'area_ha': round(area_moderate_improvement / 10000, 2) if area_moderate_improvement else 0,
+                'percentage': round((area_moderate_improvement / area_m2) * 100, 2) if area_moderate_improvement else 0
+            },
+            'high_improvement': {
+                'area_ha': round(area_high_improvement / 10000, 2) if area_high_improvement else 0,
+                'percentage': round((area_high_improvement / area_m2) * 100, 2) if area_high_improvement else 0
+            }
+        }
+        
+        # Extraer valores del píxel con mayor degradación y mejora
+        min_value = diff_stats.get('difference_min')
+        max_value = diff_stats.get('difference_max')
+        
+        return jsonify({
+            'status': 'success',
+            'index': index_name,
+            'baseline': {
+                'period': f"{baseline_start} a {baseline_end}",
+                'images': baseline_count
+            },
+            'comparison': {
+                'period': f"{comparison_start} a {comparison_end}",
+                'images': comparison_count
+            },
+            'difference_map': {
+                'tile_url': difference_tile_url,
+                'visualization': diff_viz,
+                'description': 'Diferencia absoluta (Comparación - Baseline)'
+            },
+            'percent_change_map': {
+                'tile_url': percent_tile_url,
+                'visualization': percent_viz,
+                'description': 'Cambio porcentual (%)'
+            },
+            'statistics': {
+                'mean_change': round(diff_stats.get('difference_mean'), 4) if diff_stats.get('difference_mean') else None,
+                'min_change': round(min_value, 4) if min_value else None,
+                'max_change': round(max_value, 4) if max_value else None,
+                'std_change': round(diff_stats.get('difference_stdDev'), 4) if diff_stats.get('difference_stdDev') else None,
+                'p10': round(diff_stats.get('difference_p10'), 4) if diff_stats.get('difference_p10') else None,
+                'p25': round(diff_stats.get('difference_p25'), 4) if diff_stats.get('difference_p25') else None,
+                'p50': round(diff_stats.get('difference_p50'), 4) if diff_stats.get('difference_p50') else None,
+                'p75': round(diff_stats.get('difference_p75'), 4) if diff_stats.get('difference_p75') else None,
+                'p90': round(diff_stats.get('difference_p90'), 4) if diff_stats.get('difference_p90') else None,
+            },
+            'change_areas': change_areas,
+            'area_km2': area_km2,
+            'interpretation': {
+                'high_degradation': '< -0.15 (Degradación severa)',
+                'moderate_degradation': '-0.15 a -0.05 (Degradación moderada)',
+                'stable': '-0.05 a 0.05 (Sin cambio significativo)',
+                'moderate_improvement': '0.05 a 0.15 (Mejora moderada)',
+                'high_improvement': '> 0.15 (Mejora significativa)'
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ Error en generate_change_map: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': f'Error al generar mapa de cambios: {str(e)}'
+        }), 500
+
+
+# -------------------------------------------------------
 # DEBUG: Listar todas las rutas registradas
 # -------------------------------------------------------
 print("\n" + "="*60)
