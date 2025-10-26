@@ -13,11 +13,27 @@ import tempfile
 load_dotenv()
 
 app = Flask(__name__)
+
+# CORS MEJORADO - Soporta OPTIONS preflight
 CORS(app, resources={
-    r"/api/*": {"origins": "*"},
-    r"/map/gee-tile/*": {"origins": "*"}
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
 })
 
+# Añadir manejo explícito de OPTIONS para todos los endpoints
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response
+
+# -------------------------------------------------------
+# Variables de entorno
+# -------------------------------------------------------
 EE_SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT")
 EE_PRIVATE_KEY_PATH = os.getenv("EE_PRIVATE_KEY_PATH", "./private-key_pedralcg.json")
 EE_PRIVATE_KEY_CONTENT = os.getenv("EE_PRIVATE_KEY_CONTENT")
