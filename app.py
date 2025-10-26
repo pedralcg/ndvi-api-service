@@ -1373,19 +1373,13 @@ def download_geotiff():
 
 
 # -------------------------------------------------------
-# ENDPOINT 10: Calculadora de Umbrales Inteligente
+# ENDPOINT 10: Calculadora de Umbrales Inteligente (OPTIMIZADO)
 # -------------------------------------------------------
 @app.route("/api/thresholds/calculate", methods=["POST"])
 def calculate_thresholds():
     """
     Calcula umbrales óptimos basándose en análisis estadístico de datos históricos.
-    Body: {
-        "geometry": {...},
-        "index": "NDVI",
-        "start_month": "2017-04",
-        "end_month": "2025-10",
-        "method": "percentiles"
-    }
+    OPTIMIZADO: Procesa en lotes para evitar timeouts
     """
     print("🔵 Endpoint /api/thresholds/calculate llamado")
     
@@ -1427,14 +1421,29 @@ def calculate_thresholds():
         
         print(f"📅 Periodo: {start_date} a {end_date}")
         
-        # Cargar colección
+        # Parsear fechas para serie mensual
+        start_parts = start_month.split('-')
+        end_parts = end_month.split('-')
+        start_date_ee = ee.Date.fromYMD(
+            ee.Number.parse(start_parts[0]),
+            ee.Number.parse(start_parts[1]),
+            1
+        )
+        end_date_ee = ee.Date.fromYMD(
+            ee.Number.parse(end_parts[0]),
+            ee.Number.parse(end_parts[1]),
+            1
+        ).advance(1, 'month')
+        
+        # Colección base
         collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
             .filterBounds(geometry_ee) \
-            .filterDate(start_date, end_date) \
+            .filterDate(start_date_ee, end_date_ee) \
             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
-            .map(mask_s2_clouds)
+            .map(mask_s2_clouds) \
+            .map(lambda img: add_spectral_index(img, index_name)) \
+            .select([index_name])
         
-        collection_with_index = collection.map(lambda img: add_spectral_index(img, index_name))
         total_images = collection.size().getInfo()
         print(f"🛰️ Imágenes totales: {total_images}")
         
@@ -1444,52 +1453,52 @@ def calculate_thresholds():
                 'message': 'No se encontraron imágenes para el periodo seleccionado'
             }), 404
         
-        # Generar lista de meses
-        from datetime import datetime
-        start_year, start_month_num = map(int, start_month.split('-'))
-        end_year, end_month_num = map(int, end_month.split('-'))
+        # OPTIMIZACIÓN: Usar composites mensuales directos en GEE
+        months_diff = end_date_ee.difference(start_date_ee, 'month').round()
+        seq = ee.List.sequence(0, months_diff.subtract(1))
         
-        months = []
-        current_date = datetime(start_year, start_month_num, 1)
-        end_date_obj = datetime(end_year, end_month_num, 1)
-        
-        while current_date <= end_date_obj:
-            months.append(current_date.strftime('%Y-%m'))
-            if current_date.month == 12:
-                current_date = datetime(current_date.year + 1, 1, 1)
-            else:
-                current_date = datetime(current_date.year, current_date.month + 1, 1)
-        
-        print(f"📊 Procesando {len(months)} meses...")
-        
-        # Procesar cada mes
-        timeseries = []
-        for month in months:
-            year = int(month.split('-')[0])
-            month_num = int(month.split('-')[1])
-            
-            start = ee.Date.fromYMD(year, month_num, 1)
+        def monthly_composite(i):
+            start = start_date_ee.advance(i, 'month')
             end = start.advance(1, 'month')
-            
-            monthly_collection = collection_with_index.filterDate(start, end)
-            count = monthly_collection.size().getInfo()
-            
-            if count > 0:
-                mean_image = monthly_collection.select(index_name).mean()
-                stats = mean_image.reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=geometry_ee,
-                    scale=10,
-                    maxPixels=1e9
-                ).getInfo()
-                
-                mean_value = stats.get(index_name)
-                if mean_value is not None:
-                    timeseries.append({
-                        'date': month,
-                        'mean': mean_value,
-                        'count': count
-                    })
+            monthly_col = collection.filterDate(start, end)
+            img = monthly_col.mean()
+            return img.set('system:time_start', start.millis()).set('count', monthly_col.size())
+        
+        monthly_collection = ee.ImageCollection(seq.map(monthly_composite))
+        
+        # Calcular estadísticas mensuales EN GEE (más rápido)
+        def compute_monthly_stats(img):
+            stats = img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geometry_ee,
+                scale=10,
+                maxPixels=1e9,
+                bestEffort=True
+            )
+            date = ee.Date(img.get('system:time_start')).format('YYYY-MM')
+            return ee.Feature(None, {
+                'date': date,
+                'mean': stats.get(index_name),
+                'count': img.get('count')
+            })
+        
+        series = monthly_collection.map(compute_monthly_stats).filter(
+            ee.Filter.notNull(['mean'])
+        )
+        
+        # ÚNICA LLAMADA A .getInfo() para obtener toda la serie
+        print("⏳ Procesando serie temporal completa en GEE...")
+        timeseries_data = series.getInfo()['features']
+        
+        timeseries = [
+            {
+                'date': f['properties']['date'],
+                'mean': f['properties']['mean'],
+                'count': f['properties']['count']
+            }
+            for f in timeseries_data
+            if f['properties']['mean'] is not None
+        ]
         
         print(f"✅ Serie temporal: {len(timeseries)} puntos válidos")
         
@@ -1499,7 +1508,7 @@ def calculate_thresholds():
                 'message': 'No se encontraron datos válidos para el periodo seleccionado'
             }), 404
         
-        # Extraer valores para análisis
+        # Extraer valores para análisis (en Python, rápido)
         import numpy as np
         values = np.array([item['mean'] for item in timeseries])
         
@@ -1592,6 +1601,7 @@ def calculate_thresholds():
         
     except Exception as e:
         print(f"❌ Error en calculate_thresholds: {str(e)}")
+        import traceback
         traceback.print_exc()
         return jsonify({
             'status': 'error',
