@@ -1875,6 +1875,343 @@ def generate_change_map():
 
 
 # -------------------------------------------------------
+# ENDPOINT 12: COMPOSITOR MULTI-ESPECTRAL
+# -------------------------------------------------------
+
+COMPOSICIONES_CONFIG = {
+    'RGB': {
+        'bands': ['B4', 'B3', 'B2'],
+        'min': 0.0,
+        'max': 0.3,
+        'gamma': 1.3
+    },
+    'Falso Color IR': {
+        'bands': ['B8', 'B4', 'B3'],
+        'min': 0.0,
+        'max': 0.3,
+        'gamma': 1.3
+    },
+    'Falso Color Agricola': {
+        'bands': ['B12', 'B8', 'B4'],
+        'min': 0.0,
+        'max': 0.3,
+        'gamma': 1.3
+    },
+    'Falso Color SWIR': {
+        'bands': ['B8', 'B11', 'B4'],
+        'min': 0.0,
+        'max': 0.3,
+        'gamma': 1.3
+    },
+    'Deteccion Quemado': {
+        'bands': ['B12', 'B8A', 'B4'],
+        'min': 0.0,
+        'max': 0.3,
+        'gamma': 1.3
+    }
+}
+
+INDICES_VISUALIZATION = {
+    'NDVI': {
+        'min': -0.2,
+        'max': 1.0,
+        'palette': [
+            "FFFFFF", "CE7E45", "DF923D", "F1B555", "FCD163",
+            "99B718", "74A901", "66A000", "529400", "3E8601",
+            "207401", "056201", "004C00", "002C00", "001500"
+        ]
+    },
+    'NBR': {
+        'min': -0.5,
+        'max': 1.0,
+        'palette': ['ffffff', '7a8737', 'acbe4d', '0ae042', 'fff70b', 'ffaf38', 'ff641b']
+    },
+    'CIre': {
+        'min': 0,
+        'max': 3.0,
+        'palette': ['8B4513', 'FFFF00', 'ADFF2F', '32CD32', '228B22', '006400']
+    },
+    'MSI': {
+        'min': 0.0,
+        'max': 2.5,
+        'palette': ['006400', '228B22', '9ACD32', 'FFFF00', 'FFA500', 'FF0000']
+    }
+}
+
+
+@app.route("/api/compositor", methods=["POST"])
+def compositor_multiespectral():
+    """
+    Genera múltiples composiciones espectrales e índices
+    Body: {
+        "geometry": {...},
+        "date": "2025-10-03",
+        "max_cloud": 30,
+        "composiciones": ["RGB", "Falso Color IR", ...],
+        "indices": ["NDVI", "NBR", ...]
+    }
+    """
+    print("🔵 Endpoint /api/compositor llamado")
+    
+    try:
+        data = request.json
+        print(f"📥 Datos recibidos: {data}")
+        
+        geometry = data.get('geometry')
+        date_str = data.get('date')
+        max_cloud = data.get('max_cloud', 30)
+        composiciones_solicitadas = data.get('composiciones', list(COMPOSICIONES_CONFIG.keys()))
+        indices_solicitados = data.get('indices', list(INDICES_VISUALIZATION.keys()))
+        
+        if not all([geometry, date_str]):
+            return jsonify({
+                'status': 'error',
+                'message': 'Faltan parámetros requeridos: geometry y date'
+            }), 400
+        
+        # Crear geometría con la función existente
+        geometry_ee = build_geometry_aoi(geometry)
+        
+        # Calcular área
+        area_m2 = geometry_ee.area().getInfo()
+        area_km2 = round(area_m2 / 1e6, 4)
+        area_ha = round(area_m2 / 10000, 4)
+        
+        print(f"📐 Área: {area_km2} km²")
+        
+        # Validar área (límite razonable para evitar timeouts)
+        if area_km2 > 200:
+            return jsonify({
+                'status': 'error',
+                'message': f'Área demasiado grande ({area_km2:.2f} km²). Límite: 200 km²'
+            }), 400
+        
+        date_ee = ee.Date(date_str)
+        
+        # Colección de imágenes (ventana de ±1 mes)
+        col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+            .filterBounds(geometry_ee)\
+            .filterDate(date_ee.advance(-1, 'month'), date_ee.advance(1, 'month'))\
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', max_cloud))\
+            .map(mask_s2_clouds)\
+            .map(add_all_indices)
+        
+        imgs_found = col.size().getInfo()
+        print(f"🛰️ Imágenes encontradas: {imgs_found}")
+        
+        if imgs_found == 0:
+            return jsonify({
+                'status': 'error',
+                'message': f'No se encontraron imágenes válidas con menos de {max_cloud}% de nubes'
+            }), 404
+        
+        # Obtener imagen más cercana a la fecha
+        def add_diff(img):
+            diff = ee.Number(img.date().difference(date_ee, "day")).abs()
+            return img.set("diff", diff)
+        
+        nearest = ee.Image(col.map(add_diff).sort("diff").first())
+        clipped = nearest.clip(geometry_ee)
+        
+        # Información de la imagen
+        image_date = nearest.date().format("YYYY-MM-dd").getInfo()
+        cloud_percentage = nearest.get('CLOUDY_PIXEL_PERCENTAGE').getInfo()
+        mgrs_tile = nearest.get('MGRS_TILE').getInfo()
+        spacecraft = nearest.get('SPACECRAFT_NAME').getInfo()
+        
+        print(f"✅ Imagen: {image_date} - Nubes: {cloud_percentage:.1f}%")
+        
+        # -------------------------------------------------------
+        # GENERAR COMPOSICIONES SOLICITADAS
+        # -------------------------------------------------------
+        composiciones_resultado = {}
+        
+        for comp_nombre in composiciones_solicitadas:
+            if comp_nombre not in COMPOSICIONES_CONFIG:
+                print(f"⚠️ Composición no reconocida: {comp_nombre}")
+                continue
+            
+            try:
+                config = COMPOSICIONES_CONFIG[comp_nombre]
+                
+                # Seleccionar bandas y escalar (S2 viene en 0-10000)
+                comp_img = clipped.select(config['bands']).divide(10000)
+                
+                # URL de descarga GeoTIFF
+                download_url = comp_img.getDownloadURL({
+                    'scale': 10,
+                    'crs': 'EPSG:4326',
+                    'fileFormat': 'GeoTIFF',
+                    'region': geometry_ee.bounds().getInfo()['coordinates']
+                })
+                
+                # Thumbnail (vista previa)
+                thumbnail_url = comp_img.getThumbURL({
+                    'min': config['min'],
+                    'max': config['max'],
+                    'gamma': config.get('gamma', 1.0),
+                    'dimensions': 512,
+                    'region': geometry_ee.bounds().getInfo()['coordinates'],
+                    'format': 'png'
+                })
+                
+                composiciones_resultado[comp_nombre] = {
+                    'download_url': download_url,
+                    'thumbnail_url': thumbnail_url,
+                    'bands': config['bands']
+                }
+                
+                print(f"✅ Composición generada: {comp_nombre}")
+                
+            except Exception as e:
+                print(f"⚠️ Error generando composición {comp_nombre}: {e}")
+                composiciones_resultado[comp_nombre] = {
+                    'error': str(e)
+                }
+        
+        # -------------------------------------------------------
+        # GENERAR ÍNDICES SOLICITADOS
+        # -------------------------------------------------------
+        indices_resultado = {}
+        
+        for indice_nombre in indices_solicitados:
+            if indice_nombre not in INDICES_VISUALIZATION:
+                print(f"⚠️ Índice no reconocido: {indice_nombre}")
+                continue
+            
+            try:
+                vis_params = INDICES_VISUALIZATION[indice_nombre]
+                indice_img = clipped.select(indice_nombre)
+                
+                # Calcular estadísticas completas
+                stats = indice_img.reduceRegion(
+                    reducer=ee.Reducer.mean().combine(
+                        ee.Reducer.minMax(), '', True
+                    ).combine(
+                        ee.Reducer.stdDev(), '', True
+                    ).combine(
+                        ee.Reducer.median(), '', True
+                    ),
+                    geometry=geometry_ee,
+                    scale=10,
+                    maxPixels=1e13,
+                    bestEffort=True
+                ).getInfo()
+                
+                # URL de descarga GeoTIFF
+                download_url = indice_img.getDownloadURL({
+                    'scale': 10,
+                    'crs': 'EPSG:4326',
+                    'fileFormat': 'GeoTIFF',
+                    'region': geometry_ee.bounds().getInfo()['coordinates']
+                })
+                
+                # Thumbnail con colores
+                thumbnail_url = indice_img.getThumbURL({
+                    'min': vis_params['min'],
+                    'max': vis_params['max'],
+                    'palette': vis_params['palette'],
+                    'dimensions': 512,
+                    'region': geometry_ee.bounds().getInfo()['coordinates'],
+                    'format': 'png'
+                })
+                
+                indices_resultado[indice_nombre] = {
+                    'download_url': download_url,
+                    'thumbnail_url': thumbnail_url,
+                    'statistics': {
+                        'mean': round(stats.get(f'{indice_nombre}_mean'), 4) if stats.get(f'{indice_nombre}_mean') else None,
+                        'min': round(stats.get(f'{indice_nombre}_min'), 4) if stats.get(f'{indice_nombre}_min') else None,
+                        'max': round(stats.get(f'{indice_nombre}_max'), 4) if stats.get(f'{indice_nombre}_max') else None,
+                        'std': round(stats.get(f'{indice_nombre}_stdDev'), 4) if stats.get(f'{indice_nombre}_stdDev') else None,
+                        'median': round(stats.get(f'{indice_nombre}_median'), 4) if stats.get(f'{indice_nombre}_median') else None
+                    }
+                }
+                
+                print(f"✅ Índice generado: {indice_nombre} (media: {stats.get(f'{indice_nombre}_mean'):.4f})")
+                
+            except Exception as e:
+                print(f"⚠️ Error generando índice {indice_nombre}: {e}")
+                indices_resultado[indice_nombre] = {
+                    'error': str(e)
+                }
+        
+        # -------------------------------------------------------
+        # RESPUESTA COMPLETA
+        # -------------------------------------------------------
+        return jsonify({
+            'status': 'success',
+            
+            # Información de la imagen
+            'imagery': {
+                'image_used': {
+                    'date': image_date,
+                    'cloud_percentage': round(cloud_percentage, 2) if cloud_percentage else None,
+                    'tile': mgrs_tile,
+                    'satellite': spacecraft
+                },
+                'images_count': imgs_found
+            },
+            
+            # Compatibilidad con frontend
+            'image_date': image_date,
+            'images_found': imgs_found,
+            'cloud_percentage': round(cloud_percentage, 2) if cloud_percentage else None,
+            
+            # Geometría
+            'geometry': {
+                'area_km2': area_km2,
+                'area_ha': area_ha,
+                'area_m2': round(area_m2, 2),
+                'type': geometry.get("geometry", {}).get("type", "Unknown")
+            },
+            
+            # Compatibilidad
+            'area_km2': area_km2,
+            
+            # Resultados
+            'composiciones': composiciones_resultado,
+            'indices': indices_resultado
+        })
+        
+    except Exception as e:
+        print(f"❌ Error en compositor: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': f'Error al procesar: {str(e)}'
+        }), 500
+
+
+# -------------------------------------------------------
+# ENDPOINT 13: INFORMACIÓN DE COMPOSICIONES DISPONIBLES
+# -------------------------------------------------------
+@app.route("/api/compositor/info", methods=["GET"])
+def compositor_info():
+    """
+    Retorna información sobre las composiciones e índices disponibles
+    """
+    return jsonify({
+        'status': 'success',
+        'composiciones': {
+            nombre: {
+                'bands': config['bands'],
+                'description': f"Composición usando bandas {', '.join(config['bands'])}"
+            }
+            for nombre, config in COMPOSICIONES_CONFIG.items()
+        },
+        'indices': {
+            nombre: {
+                'min': config['min'],
+                'max': config['max'],
+                'description': f"Rango: {config['min']} a {config['max']}"
+            }
+            for nombre, config in INDICES_VISUALIZATION.items()
+        }
+    })
+
+
+# -------------------------------------------------------
 # DEBUG: Listar todas las rutas registradas
 # -------------------------------------------------------
 print("\n" + "="*60)
