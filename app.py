@@ -2063,7 +2063,7 @@ def compositor_multiespectral():
         # ===== GENERAR COMPOSICIONES RGB =====
         composiciones_resultado = {}
         
-        # Mapeo de nombres con espacios a nombres sin espacios
+        # Mapeo de nombres
         comp_mapping = {
             'RGB': 'RGB',
             'Falso Color IR': 'Falso_Color_IR',
@@ -2073,7 +2073,6 @@ def compositor_multiespectral():
         }
         
         for comp_nombre_original in composiciones_solicitadas:
-            # Convertir nombre con espacios a nombre sin espacios
             comp_nombre = comp_mapping.get(comp_nombre_original, comp_nombre_original.replace(' ', '_'))
             
             if comp_nombre not in COMPOSICIONES_CONFIG:
@@ -2083,57 +2082,106 @@ def compositor_multiespectral():
             try:
                 config = COMPOSICIONES_CONFIG[comp_nombre]
                 
-                # Paso 1: Seleccionar bandas originales
+                # Seleccionar bandas originales
                 comp_img = clipped.select(config['bands'])
                 
-                # Paso 2: ⭐ CLAVE - Usar visualize() DIRECTAMENTE sobre bandas originales
-                # Esto crea una imagen RGB de 3 bandas unificadas (0-255)
-                comp_visualized = comp_img.visualize(**{
-                    'bands': config['bands'],
-                    'min': [config['min'] * 10000] * 3,  # Ajustar a escala original
-                    'max': [config['max'] * 10000] * 3,
-                    'gamma': [config.get('gamma', 1.0)] * 3
-                })
+                # Escalar y normalizar a 0-255
+                min_val = config['min'] * 10000
+                max_val = config['max'] * 10000
+                gamma = config.get('gamma', 1.0)
                 
-                # comp_visualized ahora es una imagen RGB de 3 bandas (0-255)
-                # con nombres internos 'vis-red', 'vis-green', 'vis-blue'
+                # Procesar cada banda
+                b1 = comp_img.select(config['bands'][0]).subtract(min_val).divide(max_val - min_val).clamp(0, 1)
+                b2 = comp_img.select(config['bands'][1]).subtract(min_val).divide(max_val - min_val).clamp(0, 1)
+                b3 = comp_img.select(config['bands'][2]).subtract(min_val).divide(max_val - min_val).clamp(0, 1)
                 
-                # Nombre limpio del archivo
-                clean_name = f"{clean_date}_{mgrs_tile}_{comp_nombre}.tif"
+                if gamma != 1.0:
+                    b1 = b1.pow(1.0 / gamma)
+                    b2 = b2.pow(1.0 / gamma)
+                    b3 = b3.pow(1.0 / gamma)
                 
-                # Tile URL (ya está en formato correcto RGB)
-                tile_url = comp_visualized.getMapId()['tile_fetcher'].url_format
+                # Convertir a uint8
+                b1 = b1.multiply(255).byte()
+                b2 = b2.multiply(255).byte()
+                b3 = b3.multiply(255).byte()
                 
-                # Thumbnail
-                thumbnail_url = comp_visualized.getThumbURL({
+                # Combinar en imagen multi-banda
+                comp_rgb = ee.Image.cat([b1, b2, b3]).rename(['red', 'green', 'blue'])
+                
+                clean_name = f"{clean_date}_{mgrs_tile}_{comp_nombre}"
+                
+                # Tile URL
+                tile_url = comp_rgb.getMapId({
+                    'bands': ['red', 'green', 'blue'],
+                    'min': 0,
+                    'max': 255
+                })['tile_fetcher'].url_format
+                
+                # Thumbnail pequeño
+                thumbnail_url = comp_rgb.getThumbURL({
+                    'bands': ['red', 'green', 'blue'],
+                    'min': 0,
+                    'max': 255,
                     'dimensions': 512,
                     'region': geometry_ee.bounds().getInfo()['coordinates'],
                     'format': 'png'
                 })
                 
-                # ⭐ Download URL - CRÍTICO: NO especificar 'bands', dejar que use todas
-                download_url = comp_visualized.getDownloadURL({
-                    'name': clean_name.replace('.tif', ''),
+                # ⭐ DESCARGA 1: GeoTIFF 3 bandas (para análisis profesional)
+                download_url_geotiff = comp_rgb.getDownloadURL({
+                    'name': f"{clean_name}_geotiff",
                     'scale': 10,
                     'crs': 'EPSG:4326',
                     'fileFormat': 'GeoTIFF',
                     'region': geometry_ee.bounds().getInfo()['coordinates']
                 })
                 
+                # ⭐ DESCARGA 2: PNG de alta resolución georreferenciado
+                # Calcular dimensiones óptimas basadas en área
+                bounds_coords = geometry_ee.bounds().getInfo()['coordinates'][0]
+                lats = [c[1] for c in bounds_coords]
+                lons = [c[0] for c in bounds_coords]
+                
+                # Calcular dimensiones aproximadas
+                lat_range = max(lats) - min(lats)
+                lon_range = max(lons) - min(lons)
+                
+                # Aproximar píxeles necesarios (10m/pixel)
+                # 1 grado ≈ 111km
+                pixels_needed = int(max(lat_range, lon_range) * 111000 / 10)
+                
+                # Limitar a máximo de Earth Engine (10000x10000)
+                png_dimensions = min(pixels_needed, 10000)
+                
+                # Generar PNG georreferenciado
+                download_url_png = comp_rgb.getDownloadURL({
+                    'name': f"{clean_name}_rgb",
+                    'bands': ['red', 'green', 'blue'],
+                    'dimensions': png_dimensions,
+                    'region': geometry_ee.bounds().getInfo()['coordinates'],
+                    'format': 'png',
+                    'crs': 'EPSG:4326'
+                })
+                
                 composiciones_resultado[comp_nombre_original] = {
-                    'download_url': download_url,
+                    'download_url': download_url_geotiff,  # Principal (GeoTIFF)
+                    'download_url_png': download_url_png,  # Alternativo (PNG)
                     'tile_url': tile_url,
                     'thumbnail_url': thumbnail_url,
-                    'filename': clean_name,
+                    'filename': f"{clean_name}.tif",
+                    'filename_png': f"{clean_name}_RGB.png",
                     'bands': config['bands'],
+                    'png_dimensions': png_dimensions,
                     'visualization': {
                         'min': config['min'],
                         'max': config['max'],
-                        'gamma': config.get('gamma', 1.0)
+                        'gamma': gamma
                     }
                 }
                 
-                print(f"✅ Composición RGB: {comp_nombre} → {clean_name}")
+                print(f"✅ Composición: {comp_nombre}")
+                print(f"   GeoTIFF (3 bandas): {clean_name}_geotiff.zip")
+                print(f"   PNG ({png_dimensions}px): {clean_name}_rgb.png")
                 
             except Exception as e:
                 print(f"❌ Error en composición {comp_nombre}: {e}")
@@ -2261,7 +2309,6 @@ def compositor_multiespectral():
             'status': 'error',
             'message': f'Error al procesar: {str(e)}'
         }), 500
-
 
 
 
