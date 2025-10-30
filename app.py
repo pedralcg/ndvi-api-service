@@ -2117,7 +2117,7 @@ def compositor_multiespectral():
         
         print(f"✅ Imagen: {image_date} - Cobertura: {coverage:.1f}% - Nubes: {cloud_percentage:.1f}%")
         
-        # ===== GENERAR COMPOSICIONES (CORREGIDO) =====
+        # ===== GENERAR COMPOSICIONES (SOLUCIÓN DEFINITIVA RGB) =====
         composiciones_resultado = {}
         
         for comp_nombre in composiciones_solicitadas:
@@ -2128,32 +2128,53 @@ def compositor_multiespectral():
             try:
                 config = COMPOSICIONES_CONFIG[comp_nombre]
                 
-                # Seleccionar bandas y escalar
+                # Paso 1: Seleccionar bandas y escalar (0-10000 a 0-1)
                 comp_img = clipped.select(config['bands']).divide(10000)
                 
-                # ⭐ CRÍTICO: Visualizar como RGB de 3 bandas
-                comp_visualized = comp_img.visualize(
-                    min=config['min'],
-                    max=config['max'],
-                    gamma=config.get('gamma', 1.0)
-                )
+                # Paso 2: Aplicar corrección gamma si existe
+                gamma = config.get('gamma', 1.0)
+                if gamma != 1.0:
+                    comp_img = comp_img.pow(1.0 / gamma)
                 
-                # URL de descarga GeoTIFF (ahora es imagen RGB de 3 bandas unificadas)
-                download_url = comp_visualized.getDownloadURL({
+                # Paso 3: Normalizar al rango [min, max] y escalar a [0, 1]
+                # Aplicar stretch de contraste
+                min_val = config['min']
+                max_val = config['max']
+                comp_stretched = comp_img.subtract(min_val).divide(max_val - min_val).clamp(0, 1)
+                
+                # Paso 4: Convertir a uint8 (0-255) para GeoTIFF RGB estándar
+                comp_uint8 = comp_stretched.multiply(255).byte()
+                
+                # Paso 5: Renombrar bandas a R, G, B para forzar interpretación RGB
+                comp_rgb = comp_uint8.rename(['R', 'G', 'B'])
+                
+                # ⭐ CRÍTICO: Ahora comp_rgb es una imagen de 3 bandas nombradas R, G, B
+                # Al descargar, GeoTIFF la interpreta como RGB en lugar de bandas separadas
+                
+                # Tile URL para visualización en mapa
+                tile_url = comp_rgb.getMapId({
+                    'bands': ['R', 'G', 'B'],
+                    'min': 0,
+                    'max': 255
+                })['tile_fetcher'].url_format
+                
+                # Thumbnail
+                thumbnail_url = comp_rgb.getThumbURL({
+                    'bands': ['R', 'G', 'B'],
+                    'min': 0,
+                    'max': 255,
+                    'dimensions': 512,
+                    'region': geometry_ee.bounds().getInfo()['coordinates'],
+                    'format': 'png'
+                })
+                
+                # ⭐ URL de descarga GeoTIFF (3 bandas R,G,B unificadas)
+                download_url = comp_rgb.getDownloadURL({
+                    'bands': ['R', 'G', 'B'],
                     'scale': 10,
                     'crs': 'EPSG:4326',
                     'fileFormat': 'GeoTIFF',
                     'region': geometry_ee.bounds().getInfo()['coordinates']
-                })
-                
-                # Tile URL para visualización en mapa
-                tile_url = comp_visualized.getMapId()['tile_fetcher'].url_format
-                
-                # Thumbnail
-                thumbnail_url = comp_visualized.getThumbURL({
-                    'dimensions': 512,
-                    'region': geometry_ee.bounds().getInfo()['coordinates'],
-                    'format': 'png'
                 })
                 
                 # ⭐ NOMBRE LIMPIO
@@ -2164,7 +2185,7 @@ def compositor_multiespectral():
                     'tile_url': tile_url,
                     'thumbnail_url': thumbnail_url,
                     'bands': config['bands'],
-                    'filename': clean_name,  # ⭐ NUEVO
+                    'filename': clean_name,
                     'visualization': {
                         'min': config['min'],
                         'max': config['max'],
@@ -2172,7 +2193,8 @@ def compositor_multiespectral():
                     }
                 }
                 
-                print(f"✅ Composición: {comp_nombre} → {clean_name}")
+                print(f"✅ Composición RGB: {comp_nombre} → {clean_name}")
+                print(f"   Bandas originales: {config['bands']} → RGB unificado")
                 
             except Exception as e:
                 print(f"⚠️ Error en composición {comp_nombre}: {e}")
