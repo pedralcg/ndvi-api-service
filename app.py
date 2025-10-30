@@ -2083,49 +2083,37 @@ def compositor_multiespectral():
             try:
                 config = COMPOSICIONES_CONFIG[comp_nombre]
                 
-                # Paso 1: Seleccionar y escalar bandas
-                comp_img = clipped.select(config['bands']).divide(10000)
+                # Paso 1: Seleccionar bandas originales
+                comp_img = clipped.select(config['bands'])
                 
-                # Paso 2: Aplicar gamma
-                gamma = config.get('gamma', 1.0)
-                if gamma != 1.0:
-                    comp_img = comp_img.pow(1.0 / gamma)
+                # Paso 2: ⭐ CLAVE - Usar visualize() DIRECTAMENTE sobre bandas originales
+                # Esto crea una imagen RGB de 3 bandas unificadas (0-255)
+                comp_visualized = comp_img.visualize(**{
+                    'bands': config['bands'],
+                    'min': [config['min'] * 10000] * 3,  # Ajustar a escala original
+                    'max': [config['max'] * 10000] * 3,
+                    'gamma': [config.get('gamma', 1.0)] * 3
+                })
                 
-                # Paso 3: Stretch de contraste
-                min_val = config['min']
-                max_val = config['max']
-                comp_stretched = comp_img.subtract(min_val).divide(max_val - min_val).clamp(0, 1)
-                
-                # Paso 4: Convertir a uint8
-                comp_uint8 = comp_stretched.multiply(255).byte()
-                
-                # Paso 5: Renombrar a R, G, B
-                comp_rgb = comp_uint8.rename(['vis-red', 'vis-green', 'vis-blue'])
+                # comp_visualized ahora es una imagen RGB de 3 bandas (0-255)
+                # con nombres internos 'vis-red', 'vis-green', 'vis-blue'
                 
                 # Nombre limpio del archivo
                 clean_name = f"{clean_date}_{mgrs_tile}_{comp_nombre}.tif"
                 
-                # Tile URL
-                tile_url = comp_rgb.getMapId({
-                    'bands': ['vis-red', 'vis-green', 'vis-blue'],
-                    'min': 0,
-                    'max': 255
-                })['tile_fetcher'].url_format
+                # Tile URL (ya está en formato correcto RGB)
+                tile_url = comp_visualized.getMapId()['tile_fetcher'].url_format
                 
                 # Thumbnail
-                thumbnail_url = comp_rgb.getThumbURL({
-                    'bands': ['vis-red', 'vis-green', 'vis-blue'],
-                    'min': 0,
-                    'max': 255,
+                thumbnail_url = comp_visualized.getThumbURL({
                     'dimensions': 512,
                     'region': geometry_ee.bounds().getInfo()['coordinates'],
                     'format': 'png'
                 })
                 
-                # Download URL con nombre limpio
-                download_url = comp_rgb.getDownloadURL({
-                    'name': clean_name.replace('.tif', ''),  # Sin extensión
-                    'bands': ['vis-red', 'vis-green', 'vis-blue'],
+                # ⭐ Download URL - CRÍTICO: NO especificar 'bands', dejar que use todas
+                download_url = comp_visualized.getDownloadURL({
+                    'name': clean_name.replace('.tif', ''),
                     'scale': 10,
                     'crs': 'EPSG:4326',
                     'fileFormat': 'GeoTIFF',
@@ -2141,7 +2129,7 @@ def compositor_multiespectral():
                     'visualization': {
                         'min': config['min'],
                         'max': config['max'],
-                        'gamma': gamma
+                        'gamma': config.get('gamma', 1.0)
                     }
                 }
                 
