@@ -1875,11 +1875,15 @@ def generate_change_map():
             'message': f'Error al generar mapa de cambios: {str(e)}'
         }), 500
 
-
 # -------------------------------------------------------
-# ENDPOINT 12: COMPOSITOR MULTI-ESPECTRAL
 # -------------------------------------------------------
 
+
+# -------------------------------------------------------
+# ENDPOINT 12: COMPOSITOR MULTI-ESPECTRAL - VERSIÓN COMPLETA Y FUNCIONAL
+# -------------------------------------------------------
+
+# ===== CONFIGURACIÓN =====
 COMPOSICIONES_CONFIG = {
     'RGB': {
         'bands': ['B4', 'B3', 'B2'],
@@ -1887,25 +1891,25 @@ COMPOSICIONES_CONFIG = {
         'max': 0.3,
         'gamma': 1.3
     },
-    'Falso Color IR': {
+    'Falso_Color_IR': {
         'bands': ['B8', 'B4', 'B3'],
         'min': 0.0,
         'max': 0.3,
         'gamma': 1.3
     },
-    'Falso Color Agricola': {
+    'Falso_Color_Agricola': {
         'bands': ['B12', 'B8', 'B4'],
         'min': 0.0,
         'max': 0.3,
         'gamma': 1.3
     },
-    'Falso Color SWIR': {
+    'Falso_Color_SWIR': {
         'bands': ['B8', 'B11', 'B4'],
         'min': 0.0,
         'max': 0.3,
         'gamma': 1.3
     },
-    'Deteccion Quemado': {
+    'Deteccion_Quemado': {
         'bands': ['B12', 'B8A', 'B4'],
         'min': 0.0,
         'max': 0.3,
@@ -1941,54 +1945,14 @@ INDICES_VISUALIZATION = {
 }
 
 
-# ===== FUNCIÓN PARA LIMPIAR NOMBRES DE ARCHIVO =====
-def clean_filename(raw_url, index_or_comp_name):
-    """
-    Convierte nombres largos de GEE en formato limpio:
-    De: 20251021T105111_20251021T105829_T30SXH.NBR.tif
-    A:  20251021_T30SXH_NBR.tif
-    """
-    try:
-        # Extraer partes del nombre del archivo de la URL
-        filename = raw_url.split('/')[-1].split('?')[0]
-        
-        # Patrón: captura fecha (YYYYMMDD), tile (T30SXH) y extensión
-        match = re.search(r'(\d{8})T\d+_\d{8}T\d+_([A-Z0-9]+)\.', filename)
-        
-        if match:
-            date_part = match.group(1)  # 20251021
-            tile_part = match.group(2)  # T30SXH
-            
-            # Formato limpio: YYYYMMDD_TILE_INDEX.tif
-            clean_name = f"{date_part}_{tile_part}_{index_or_comp_name}.tif"
-            return clean_name
-        else:
-            # Fallback: si no coincide el patrón, usar nombre genérico
-            return f"download_{index_or_comp_name}.tif"
-            
-    except Exception as e:
-        print(f"⚠️ Error limpiando nombre: {e}")
-        return f"download_{index_or_comp_name}.tif"
-
-
-# ===== FUNCIÓN DE SELECCIÓN DE MEJOR IMAGEN (SIN MÁSCARA) =====
+# ===== FUNCIÓN DE SELECCIÓN DE MEJOR IMAGEN =====
 def select_best_image_compositor(collection, target_date, geometry):
     """
     Selecciona la imagen más completa y cercana a la fecha objetivo.
-    VERSIÓN SIN MÁSCARA DE NUBES para evitar enmascarar zonas urbanas.
-    
-    Prioriza:
-    1. Cercanía a la fecha objetivo
-    2. Menor nubosidad
-    3. Cobertura del área (usando datos válidos, no máscaras)
+    SIN MÁSCARA DE NUBES para evitar enmascarar zonas urbanas.
     """
-    
     def add_metrics(img):
-        # Calcular diferencia de fecha
         diff = ee.Number(img.date().difference(target_date, 'day')).abs()
-        
-        # Calcular cobertura: % de píxeles con datos válidos (sin usar máscara)
-        # Usar B4 (Red) como referencia ya que siempre tiene datos
         valid_pixels = img.select('B4').reduceRegion(
             reducer=ee.Reducer.count(),
             geometry=geometry,
@@ -1997,14 +1961,9 @@ def select_best_image_compositor(collection, target_date, geometry):
             bestEffort=True
         ).get('B4')
         
-        # Área total en píxeles (10m x 10m = 100m² por píxel)
         total_area = geometry.area()
         expected_pixels = total_area.divide(100)
-        
-        # Porcentaje de cobertura
         coverage = ee.Number(valid_pixels).divide(expected_pixels).multiply(100)
-        
-        # Nubosidad del metadato
         cloud = img.get('CLOUDY_PIXEL_PERCENTAGE')
         
         return img.set({
@@ -2013,16 +1972,10 @@ def select_best_image_compositor(collection, target_date, geometry):
             'cloud': cloud
         })
     
-    # Añadir métricas
     collection_with_metrics = collection.map(add_metrics)
-    
-    # Filtrar imágenes con cobertura mínima del 70% (más permisivo)
-    good_coverage = collection_with_metrics.filter(
-        ee.Filter.gte('coverage', 70)
-    )
-    
-    # Si no hay imágenes con 70%, usar 50%
+    good_coverage = collection_with_metrics.filter(ee.Filter.gte('coverage', 70))
     count = good_coverage.size()
+    
     final_collection = ee.Algorithms.If(
         count.gt(0),
         good_coverage,
@@ -2030,45 +1983,37 @@ def select_best_image_compositor(collection, target_date, geometry):
     )
     
     final_collection = ee.ImageCollection(final_collection)
-    
-    # Ordenar por: 1) fecha cercana, 2) menos nubes
     sorted_collection = final_collection.sort('date_diff').sort('cloud')
     
-    # Retornar la mejor imagen
     return sorted_collection.first()
 
 
-# ===== ENDPOINT COMPOSITOR ACTUALIZADO =====
+# ===== ENDPOINT COMPOSITOR =====
 @app.route("/api/compositor", methods=["POST"])
 def compositor_multiespectral():
     """
     Genera múltiples composiciones espectrales e índices
-    VERSIÓN CORREGIDA: Composiciones RGB unificadas + nombres limpios
     """
     print("🔵 Endpoint /api/compositor llamado")
     
     try:
         data = request.json
-        print(f"📥 Datos recibidos: {data}")
-        
         geometry = data.get('geometry')
         date_str = data.get('date')
         max_cloud = data.get('max_cloud', 30)
-        composiciones_solicitadas = data.get('composiciones', list(COMPOSICIONES_CONFIG.keys()))
-        indices_solicitados = data.get('indices', list(INDICES_VISUALIZATION.keys()))
+        composiciones_solicitadas = data.get('composiciones', [])
+        indices_solicitados = data.get('indices', [])
         
         if not all([geometry, date_str]):
             return jsonify({
                 'status': 'error',
-                'message': 'Faltan parámetros requeridos: geometry y date'
+                'message': 'Faltan parámetros: geometry y date'
             }), 400
         
         geometry_ee = build_geometry_aoi(geometry)
         area_m2 = geometry_ee.area().getInfo()
         area_km2 = round(area_m2 / 1e6, 4)
         area_ha = round(area_m2 / 10000, 4)
-        
-        print(f"📐 Área: {area_km2} km²")
         
         if area_km2 > 200:
             return jsonify({
@@ -2078,31 +2023,28 @@ def compositor_multiespectral():
         
         date_ee = ee.Date(date_str)
         
-        # Colección con ventana de ±15 días (SIN MÁSCARA DE NUBES)
+        # Colección SIN máscara de nubes
         col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
             .filterBounds(geometry_ee)\
             .filterDate(date_ee.advance(-15, 'day'), date_ee.advance(15, 'day'))\
             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', max_cloud))\
-            .map(add_all_indices)  # ⭐ ELIMINADO: .map(mask_s2_clouds)
+            .map(add_all_indices)
         
         imgs_found = col.size().getInfo()
-        print(f"🛰️ Imágenes encontradas: {imgs_found}")
         
         if imgs_found == 0:
             return jsonify({
                 'status': 'error',
-                'message': f'No se encontraron imágenes válidas en ±15 días con menos de {max_cloud}% de nubes'
+                'message': f'No hay imágenes en ±15 días con <{max_cloud}% nubes'
             }), 404
         
-        # Seleccionar la mejor imagen (SIN MÁSCARA)
-        print("🔍 Seleccionando la mejor imagen...")
+        # Seleccionar mejor imagen
         best_image = select_best_image_compositor(col, date_ee, geometry_ee)
         
-        best_image_info = best_image.getInfo()
-        if not best_image_info:
+        if not best_image.getInfo():
             return jsonify({
                 'status': 'error',
-                'message': 'No se pudo seleccionar una imagen válida'
+                'message': 'No se pudo seleccionar imagen válida'
             }), 404
         
         clipped = best_image.clip(geometry_ee)
@@ -2115,12 +2057,25 @@ def compositor_multiespectral():
         mgrs_tile = best_image.get('MGRS_TILE').getInfo()
         spacecraft = best_image.get('SPACECRAFT_NAME').getInfo()
         
-        print(f"✅ Imagen: {image_date} - Cobertura: {coverage:.1f}% - Nubes: {cloud_percentage:.1f}%")
+        # Extraer solo fecha sin horas para nombre limpio
+        clean_date = image_date.replace('-', '')  # 20251024
         
-        # ===== GENERAR COMPOSICIONES (SOLUCIÓN DEFINITIVA RGB) =====
+        # ===== GENERAR COMPOSICIONES RGB =====
         composiciones_resultado = {}
         
-        for comp_nombre in composiciones_solicitadas:
+        # Mapeo de nombres con espacios a nombres sin espacios
+        comp_mapping = {
+            'RGB': 'RGB',
+            'Falso Color IR': 'Falso_Color_IR',
+            'Falso Color Agricola': 'Falso_Color_Agricola',
+            'Falso Color SWIR': 'Falso_Color_SWIR',
+            'Deteccion Quemado': 'Deteccion_Quemado'
+        }
+        
+        for comp_nombre_original in composiciones_solicitadas:
+            # Convertir nombre con espacios a nombre sin espacios
+            comp_nombre = comp_mapping.get(comp_nombre_original, comp_nombre_original.replace(' ', '_'))
+            
             if comp_nombre not in COMPOSICIONES_CONFIG:
                 print(f"⚠️ Composición no reconocida: {comp_nombre}")
                 continue
@@ -2128,39 +2083,38 @@ def compositor_multiespectral():
             try:
                 config = COMPOSICIONES_CONFIG[comp_nombre]
                 
-                # Paso 1: Seleccionar bandas y escalar (0-10000 a 0-1)
+                # Paso 1: Seleccionar y escalar bandas
                 comp_img = clipped.select(config['bands']).divide(10000)
                 
-                # Paso 2: Aplicar corrección gamma si existe
+                # Paso 2: Aplicar gamma
                 gamma = config.get('gamma', 1.0)
                 if gamma != 1.0:
                     comp_img = comp_img.pow(1.0 / gamma)
                 
-                # Paso 3: Normalizar al rango [min, max] y escalar a [0, 1]
-                # Aplicar stretch de contraste
+                # Paso 3: Stretch de contraste
                 min_val = config['min']
                 max_val = config['max']
                 comp_stretched = comp_img.subtract(min_val).divide(max_val - min_val).clamp(0, 1)
                 
-                # Paso 4: Convertir a uint8 (0-255) para GeoTIFF RGB estándar
+                # Paso 4: Convertir a uint8
                 comp_uint8 = comp_stretched.multiply(255).byte()
                 
-                # Paso 5: Renombrar bandas a R, G, B para forzar interpretación RGB
-                comp_rgb = comp_uint8.rename(['R', 'G', 'B'])
+                # Paso 5: Renombrar a R, G, B
+                comp_rgb = comp_uint8.rename(['vis-red', 'vis-green', 'vis-blue'])
                 
-                # ⭐ CRÍTICO: Ahora comp_rgb es una imagen de 3 bandas nombradas R, G, B
-                # Al descargar, GeoTIFF la interpreta como RGB en lugar de bandas separadas
+                # Nombre limpio del archivo
+                clean_name = f"{clean_date}_{mgrs_tile}_{comp_nombre}.tif"
                 
-                # Tile URL para visualización en mapa
+                # Tile URL
                 tile_url = comp_rgb.getMapId({
-                    'bands': ['R', 'G', 'B'],
+                    'bands': ['vis-red', 'vis-green', 'vis-blue'],
                     'min': 0,
                     'max': 255
                 })['tile_fetcher'].url_format
                 
                 # Thumbnail
                 thumbnail_url = comp_rgb.getThumbURL({
-                    'bands': ['R', 'G', 'B'],
+                    'bands': ['vis-red', 'vis-green', 'vis-blue'],
                     'min': 0,
                     'max': 255,
                     'dimensions': 512,
@@ -2168,38 +2122,35 @@ def compositor_multiespectral():
                     'format': 'png'
                 })
                 
-                # ⭐ URL de descarga GeoTIFF (3 bandas R,G,B unificadas)
+                # Download URL con nombre limpio
                 download_url = comp_rgb.getDownloadURL({
-                    'bands': ['R', 'G', 'B'],
+                    'name': clean_name.replace('.tif', ''),  # Sin extensión
+                    'bands': ['vis-red', 'vis-green', 'vis-blue'],
                     'scale': 10,
                     'crs': 'EPSG:4326',
                     'fileFormat': 'GeoTIFF',
                     'region': geometry_ee.bounds().getInfo()['coordinates']
                 })
                 
-                # ⭐ NOMBRE LIMPIO
-                clean_name = clean_filename(download_url, comp_nombre.replace(' ', '_'))
-                
-                composiciones_resultado[comp_nombre] = {
+                composiciones_resultado[comp_nombre_original] = {
                     'download_url': download_url,
                     'tile_url': tile_url,
                     'thumbnail_url': thumbnail_url,
-                    'bands': config['bands'],
                     'filename': clean_name,
+                    'bands': config['bands'],
                     'visualization': {
                         'min': config['min'],
                         'max': config['max'],
-                        'gamma': config.get('gamma', 1.0)
+                        'gamma': gamma
                     }
                 }
                 
                 print(f"✅ Composición RGB: {comp_nombre} → {clean_name}")
-                print(f"   Bandas originales: {config['bands']} → RGB unificado")
                 
             except Exception as e:
-                print(f"⚠️ Error en composición {comp_nombre}: {e}")
+                print(f"❌ Error en composición {comp_nombre}: {e}")
                 traceback.print_exc()
-                composiciones_resultado[comp_nombre] = {'error': str(e)}
+                composiciones_resultado[comp_nombre_original] = {'error': str(e)}
         
         # ===== GENERAR ÍNDICES =====
         indices_resultado = {}
@@ -2228,16 +2179,11 @@ def compositor_multiespectral():
                     bestEffort=True
                 ).getInfo()
                 
-                # Tile URL para mapa
-                tile_url = indice_img.getMapId(vis_params)['tile_fetcher'].url_format
+                # Nombre limpio
+                clean_name = f"{clean_date}_{mgrs_tile}_{indice_nombre}.tif"
                 
-                # URL de descarga
-                download_url = indice_img.getDownloadURL({
-                    'scale': 10,
-                    'crs': 'EPSG:4326',
-                    'fileFormat': 'GeoTIFF',
-                    'region': geometry_ee.bounds().getInfo()['coordinates']
-                })
+                # Tile URL
+                tile_url = indice_img.getMapId(vis_params)['tile_fetcher'].url_format
                 
                 # Thumbnail
                 thumbnail_url = indice_img.getThumbURL({
@@ -2249,14 +2195,20 @@ def compositor_multiespectral():
                     'format': 'png'
                 })
                 
-                # ⭐ NOMBRE LIMPIO
-                clean_name = clean_filename(download_url, indice_nombre)
+                # Download URL con nombre limpio
+                download_url = indice_img.getDownloadURL({
+                    'name': clean_name.replace('.tif', ''),  # Sin extensión
+                    'scale': 10,
+                    'crs': 'EPSG:4326',
+                    'fileFormat': 'GeoTIFF',
+                    'region': geometry_ee.bounds().getInfo()['coordinates']
+                })
                 
                 indices_resultado[indice_nombre] = {
                     'download_url': download_url,
                     'tile_url': tile_url,
                     'thumbnail_url': thumbnail_url,
-                    'filename': clean_name,  # ⭐ NUEVO
+                    'filename': clean_name,
                     'statistics': {
                         'mean': round(stats.get(f'{indice_nombre}_mean'), 4) if stats.get(f'{indice_nombre}_mean') else None,
                         'min': round(stats.get(f'{indice_nombre}_min'), 4) if stats.get(f'{indice_nombre}_min') else None,
@@ -2270,11 +2222,11 @@ def compositor_multiespectral():
                 print(f"✅ Índice: {indice_nombre} → {clean_name}")
                 
             except Exception as e:
-                print(f"⚠️ Error en índice {indice_nombre}: {e}")
+                print(f"❌ Error en índice {indice_nombre}: {e}")
                 traceback.print_exc()
                 indices_resultado[indice_nombre] = {'error': str(e)}
         
-        # Bounds para mapa
+        # Bounds
         try:
             bounds_obj = geometry_ee.bounds().getInfo()
             coords = bounds_obj["coordinates"][0]
@@ -2321,6 +2273,8 @@ def compositor_multiespectral():
             'status': 'error',
             'message': f'Error al procesar: {str(e)}'
         }), 500
+
+
 
 
 # -------------------------------------------------------
