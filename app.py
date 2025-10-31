@@ -1988,11 +1988,11 @@ def select_best_image_compositor(collection, target_date, geometry):
     return sorted_collection.first()
 
 
-# ===== ENDPOINT COMPOSITOR =====
+# ENDPOINT 12: COMPOSITOR MULTI-ESPECTRAL - CON INSTRUCCIONES TXT
 @app.route("/api/compositor", methods=["POST"])
 def compositor_multiespectral():
     """
-    Genera múltiples composiciones espectrales e índices
+    Genera múltiples composiciones espectrales e índices con instrucciones
     """
     print("🔵 Endpoint /api/compositor llamado")
     
@@ -2057,13 +2057,11 @@ def compositor_multiespectral():
         mgrs_tile = best_image.get('MGRS_TILE').getInfo()
         spacecraft = best_image.get('SPACECRAFT_NAME').getInfo()
         
-        # Extraer solo fecha sin horas para nombre limpio
-        clean_date = image_date.replace('-', '')  # 20251024
+        clean_date = image_date.replace('-', '')
         
         # ===== GENERAR COMPOSICIONES RGB =====
         composiciones_resultado = {}
         
-        # Mapeo de nombres
         comp_mapping = {
             'RGB': 'RGB',
             'Falso Color IR': 'Falso_Color_IR',
@@ -2081,16 +2079,12 @@ def compositor_multiespectral():
             
             try:
                 config = COMPOSICIONES_CONFIG[comp_nombre]
-                
-                # Seleccionar bandas originales
                 comp_img = clipped.select(config['bands'])
                 
-                # Escalar y normalizar a 0-255
                 min_val = config['min'] * 10000
                 max_val = config['max'] * 10000
                 gamma = config.get('gamma', 1.0)
                 
-                # Procesar cada banda
                 b1 = comp_img.select(config['bands'][0]).subtract(min_val).divide(max_val - min_val).clamp(0, 1)
                 b2 = comp_img.select(config['bands'][1]).subtract(min_val).divide(max_val - min_val).clamp(0, 1)
                 b3 = comp_img.select(config['bands'][2]).subtract(min_val).divide(max_val - min_val).clamp(0, 1)
@@ -2100,24 +2094,20 @@ def compositor_multiespectral():
                     b2 = b2.pow(1.0 / gamma)
                     b3 = b3.pow(1.0 / gamma)
                 
-                # Convertir a uint8
                 b1 = b1.multiply(255).byte()
                 b2 = b2.multiply(255).byte()
                 b3 = b3.multiply(255).byte()
                 
-                # Combinar en imagen multi-banda
                 comp_rgb = ee.Image.cat([b1, b2, b3]).rename(['red', 'green', 'blue'])
                 
                 clean_name = f"{clean_date}_{mgrs_tile}_{comp_nombre}"
                 
-                # Tile URL
                 tile_url = comp_rgb.getMapId({
                     'bands': ['red', 'green', 'blue'],
                     'min': 0,
                     'max': 255
                 })['tile_fetcher'].url_format
                 
-                # Thumbnail pequeño
                 thumbnail_url = comp_rgb.getThumbURL({
                     'bands': ['red', 'green', 'blue'],
                     'min': 0,
@@ -2127,7 +2117,6 @@ def compositor_multiespectral():
                     'format': 'png'
                 })
                 
-                # ⭐ DESCARGA 1: GeoTIFF 3 bandas (para análisis profesional)
                 download_url_geotiff = comp_rgb.getDownloadURL({
                     'name': f"{clean_name}_geotiff",
                     'scale': 10,
@@ -2136,24 +2125,14 @@ def compositor_multiespectral():
                     'region': geometry_ee.bounds().getInfo()['coordinates']
                 })
                 
-                # ⭐ DESCARGA 2: PNG de alta resolución georreferenciado
-                # Calcular dimensiones óptimas basadas en área
                 bounds_coords = geometry_ee.bounds().getInfo()['coordinates'][0]
                 lats = [c[1] for c in bounds_coords]
                 lons = [c[0] for c in bounds_coords]
-                
-                # Calcular dimensiones aproximadas
                 lat_range = max(lats) - min(lats)
                 lon_range = max(lons) - min(lons)
-                
-                # Aproximar píxeles necesarios (10m/pixel)
-                # 1 grado ≈ 111km
                 pixels_needed = int(max(lat_range, lon_range) * 111000 / 10)
-                
-                # Limitar a máximo de Earth Engine (10000x10000)
                 png_dimensions = min(pixels_needed, 10000)
                 
-                # Generar PNG georreferenciado
                 download_url_png = comp_rgb.getDownloadURL({
                     'name': f"{clean_name}_rgb",
                     'bands': ['red', 'green', 'blue'],
@@ -2163,9 +2142,151 @@ def compositor_multiespectral():
                     'crs': 'EPSG:4326'
                 })
                 
+                # ⭐ GENERAR INSTRUCCIONES TXT
+                instructions_text = f"""═══════════════════════════════════════════════════════════════
+  INSTRUCCIONES: COMPOSICIÓN RGB SENTINEL-2
+═══════════════════════════════════════════════════════════════
+
+📁 ARCHIVOS INCLUIDOS:
+   • {clean_name}_geotiff.red.tif   (Banda Roja - R)
+   • {clean_name}_geotiff.green.tif (Banda Verde - G)
+   • {clean_name}_geotiff.blue.tif  (Banda Azul - B)
+   • INSTRUCCIONES.txt (este archivo)
+
+📊 INFORMACIÓN DE LA IMAGEN:
+   • Fecha: {image_date}
+   • Tile Sentinel-2: {mgrs_tile}
+   • Composición: {comp_nombre}
+   • Bandas: {', '.join(config['bands'])}
+   • Resolución: 10 metros
+   • Sistema de coordenadas: EPSG:4326 (WGS84)
+
+═══════════════════════════════════════════════════════════════
+  MÉTODO 1: QGIS (Recomendado)
+═══════════════════════════════════════════════════════════════
+
+OPCIÓN A - Build Virtual Raster (Rápido):
+─────────────────────────────────────────
+1. Menú → Raster → Miscellaneous → Build Virtual Raster
+2. Input layers: Seleccionar las 3 bandas (.red, .green, .blue)
+3. ✓ Marcar: "Place each file into a separate band"
+4. Output file: Guardar como "{clean_name}.vrt"
+5. Hacer clic en "Run"
+6. ✅ El archivo .vrt se carga automáticamente en QGIS
+
+OPCIÓN B - Composite Bands (Permanente):
+─────────────────────────────────────────
+1. Menú → Raster → Miscellaneous → Composite Bands
+2. Input layers: Añadir las 3 bandas en orden:
+   - Band 1: {clean_name}_geotiff.red.tif
+   - Band 2: {clean_name}_geotiff.green.tif
+   - Band 3: {clean_name}_geotiff.blue.tif
+3. Output file: Guardar como "{clean_name}_RGB.tif"
+4. Hacer clic en "Run"
+5. Clic derecho → Properties → Symbology
+6. Render type: Multiband color
+   - Red band: Band 1
+   - Green band: Band 2
+   - Blue band: Band 3
+
+AJUSTAR VISUALIZACIÓN EN QGIS:
+──────────────────────────────
+- Clic derecho en la capa → Properties → Symbology
+- Min/Max Value Settings:
+  - Statistics extent: "Whole raster"
+  - Accuracy: "Actual (slower)"
+  - Min: 0
+  - Max: 255
+- Load → Apply → OK
+
+═══════════════════════════════════════════════════════════════
+  MÉTODO 2: ArcGIS Pro
+═══════════════════════════════════════════════════════════════
+
+1. Abrir ArcGIS Pro
+2. Menú → Insert → New Map
+3. Añadir las 3 bandas:
+   - Arrastrar los 3 archivos .tif al mapa
+4. Crear composición RGB:
+   - Geoprocessing → Buscar "Composite Bands"
+   - Input Rasters: Añadir las 3 bandas en orden (R, G, B)
+   - Output Raster: "{clean_name}_RGB.tif"
+   - Run
+5. Visualización:
+   - Clic derecho → Symbology
+   - Primary Symbology: RGB
+   - Red Channel: Band_1
+   - Green Channel: Band_2
+   - Blue Channel: Band_3
+   - Stretch Type: Standard Deviation (2.5)
+
+═══════════════════════════════════════════════════════════════
+  MÉTODO 3: ArcMap (Versiones antiguas)
+═══════════════════════════════════════════════════════════════
+
+1. Abrir ArcMap
+2. ArcToolbox → Data Management Tools → Raster → Raster Processing
+   → Composite Bands
+3. Input Rasters: Añadir las 3 bandas en orden
+   - {clean_name}_geotiff.red.tif
+   - {clean_name}_geotiff.green.tif
+   - {clean_name}_geotiff.blue.tif
+4. Output Raster: "{clean_name}_RGB.tif"
+5. OK (esperar procesamiento)
+6. Ajustar simbología:
+   - Clic derecho en capa → Properties → Symbology
+   - Show: RGB Composite
+   - Red: Band_1
+   - Green: Band_2
+   - Blue: Band_3
+   - Stretch: Standard Deviations (2.5)
+
+═══════════════════════════════════════════════════════════════
+  SOLUCIÓN DE PROBLEMAS
+═══════════════════════════════════════════════════════════════
+
+❌ PROBLEMA: "Imagen se ve muy oscura o muy clara"
+✅ SOLUCIÓN: Ajustar el Stretch/Contraste:
+   - QGIS: Min 0, Max 255 (o usar "Mean +/- std dev")
+   - ArcGIS: Usar "Standard Deviation" stretch
+
+❌ PROBLEMA: "Los colores no se ven bien"
+✅ SOLUCIÓN: Verificar orden de bandas:
+   - Red debe ser Band 1 (rojo)
+   - Green debe ser Band 2 (verde)
+   - Blue debe ser Band 3 (azul)
+
+❌ PROBLEMA: "No veo la imagen georreferenciada"
+✅ SOLUCIÓN: Verificar sistema de coordenadas:
+   - Las bandas están en EPSG:4326 (WGS84)
+   - Asegurar que el proyecto usa la misma proyección
+
+═══════════════════════════════════════════════════════════════
+  INFORMACIÓN TÉCNICA
+═══════════════════════════════════════════════════════════════
+
+- Fuente: Sentinel-2 SR Harmonized (Copernicus)
+- Procesamiento: Google Earth Engine
+- Formato: GeoTIFF (uint8, 0-255)
+- Tipo de dato: Byte (8-bit unsigned integer)
+- Valor NoData: None
+- Compresión: LZW (si aplica)
+
+═══════════════════════════════════════════════════════════════
+  CONTACTO Y SOPORTE
+═══════════════════════════════════════════════════════════════
+
+Para más información sobre esta composición o reportar problemas:
+- Aplicación: GeoVisor Multi-Compositor
+- Generado: {image_date}
+
+═══════════════════════════════════════════════════════════════
+"""
+                
                 composiciones_resultado[comp_nombre_original] = {
-                    'download_url': download_url_geotiff,  # Principal (GeoTIFF)
-                    'download_url_png': download_url_png,  # Alternativo (PNG)
+                    'download_url': download_url_geotiff,
+                    'download_url_png': download_url_png,
+                    'instructions_txt': instructions_text,
                     'tile_url': tile_url,
                     'thumbnail_url': thumbnail_url,
                     'filename': f"{clean_name}.tif",
@@ -2180,15 +2301,13 @@ def compositor_multiespectral():
                 }
                 
                 print(f"✅ Composición: {comp_nombre}")
-                print(f"   GeoTIFF (3 bandas): {clean_name}_geotiff.zip")
-                print(f"   PNG ({png_dimensions}px): {clean_name}_rgb.png")
                 
             except Exception as e:
                 print(f"❌ Error en composición {comp_nombre}: {e}")
                 traceback.print_exc()
                 composiciones_resultado[comp_nombre_original] = {'error': str(e)}
         
-        # ===== GENERAR ÍNDICES =====
+        # ===== GENERAR ÍNDICES (sin cambios) =====
         indices_resultado = {}
         
         for indice_nombre in indices_solicitados:
@@ -2200,7 +2319,6 @@ def compositor_multiespectral():
                 vis_params = INDICES_VISUALIZATION[indice_nombre]
                 indice_img = clipped.select(indice_nombre)
                 
-                # Estadísticas
                 stats = indice_img.reduceRegion(
                     reducer=ee.Reducer.mean().combine(
                         ee.Reducer.minMax(), '', True
@@ -2215,13 +2333,10 @@ def compositor_multiespectral():
                     bestEffort=True
                 ).getInfo()
                 
-                # Nombre limpio
                 clean_name = f"{clean_date}_{mgrs_tile}_{indice_nombre}.tif"
                 
-                # Tile URL
                 tile_url = indice_img.getMapId(vis_params)['tile_fetcher'].url_format
                 
-                # Thumbnail
                 thumbnail_url = indice_img.getThumbURL({
                     'min': vis_params['min'],
                     'max': vis_params['max'],
@@ -2231,9 +2346,8 @@ def compositor_multiespectral():
                     'format': 'png'
                 })
                 
-                # Download URL con nombre limpio
                 download_url = indice_img.getDownloadURL({
-                    'name': clean_name.replace('.tif', ''),  # Sin extensión
+                    'name': clean_name.replace('.tif', ''),
                     'scale': 10,
                     'crs': 'EPSG:4326',
                     'fileFormat': 'GeoTIFF',
